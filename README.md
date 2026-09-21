@@ -40,7 +40,59 @@ OAuth 登录后 `domain` 由服务端下发；API Key 模式在凭据 JSON 里�
 
 ## 安装
 
-### A. 本地编译（自用推荐）
+### A. 插件商店 / 在线安装（推荐）
+
+仓库根目录提供符合 CPA 校验的 [`registry.json`](registry.json)（`schema_version: 1`，`install` 默认 `github-release`）。CPA 读到条目后，会去 **GitHub latest Release** 拉对应平台 zip。
+
+#### 1）发布 Release 资产（安装前置）
+
+打 tag 后 GitHub Actions 会产出：
+
+- `workbuddy_<version>_<goos>_<goarch>.zip`（zip **根目录只有** `workbuddy.so` / `.dylib` / `.dll`）
+- `checksums.txt`（sha256sum 格式）
+
+```bash
+git tag v0.3.0 && git push origin v0.3.0
+```
+
+没有 Release 资产时，商店能看到插件，但安装会失败。
+
+#### 2）在 CPA 添加本仓库商店源（私有 / 自用，马上可测）
+
+`config.yaml`：
+
+```yaml
+plugins:
+  enabled: true
+  dir: "plugins"
+  # 额外商店源：指向 raw registry.json（GitHub / 自建 HTTP 均可）
+  store-sources:
+    - "https://raw.githubusercontent.com/WslzGmzs/workbuddy-cli-proxy/main/registry.json"
+  configs:
+    workbuddy: { enabled: true, priority: 100 }
+```
+
+然后管理端 **插件商店** 刷新，应能看到 **WorkBuddy (CodeBuddy)**；或：
+
+```http
+GET  /v0/management/plugin-store
+POST /v0/management/plugin-store/workbuddy/install
+```
+
+（若同 ID 多源，可用 `?source=` 指定。）
+
+本地未推送时，也可起静态文件服务挂载本仓库的 `registry.json`，把 `store-sources` 写成该 URL。
+
+#### 3）官方商店（可选）
+
+把 [`docs/plugin-store-entry.json`](docs/plugin-store-entry.json) 合并进  
+[CLIProxyAPI-Plugins-Store/registry.json](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store) 提 PR；合并后无需自配 `store-sources`。
+
+#### 4）启用
+
+安装成功后确认 `plugins.configs.workbuddy.enabled: true`，重启或热加载后日志出现 `plugin loaded ... plugin_id=workbuddy`。
+
+### B. 本地编译
 
 **前置**：CLIProxyAPI v7.2.x（带 CGO / 插件支持）、Go 1.26+、gcc；架构与 CPA 一致。
 
@@ -48,8 +100,12 @@ OAuth 登录后 `domain` 由服务端下发；API Key 模式在凭据 JSON 里�
 git clone https://github.com/WslzGmzs/workbuddy-cli-proxy.git
 cd workbuddy-cli-proxy
 
+# 当前平台
 make build
 # → dist/workbuddy.so | .dylib | .dll
+
+# 指定平台并打成商店兼容 zip
+make package VERSION=0.3.0 GOOS=linux GOARCH=amd64
 ```
 
 也可手写：
@@ -60,33 +116,7 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
   -o workbuddy.so .
 ```
 
-把产物放到 CPA 的 `plugins/`（或 `plugins/<goos>/<goarch>/`），在 `config.yaml` 启用配置后重启，日志出现 `plugin loaded ... plugin_id=workbuddy` 即成功：
-
-```yaml
-plugins:
-  enabled: true
-  dir: "plugins"
-  configs:
-    workbuddy: { enabled: true, priority: 100 }
-```
-
-### B. 插件商店在线安装
-
-仓库根目录的 [`registry.json`](registry.json) 符合 CPA `schema_version: 1` 格式。在 `config.yaml` 里加上商店源，CPA 会去 GitHub latest Release 拉对应平台 zip：
-
-```yaml
-plugins:
-  store-sources:
-    - "https://raw.githubusercontent.com/WslzGmzs/workbuddy-cli-proxy/main/registry.json"
-```
-
-然后在管理端 **插件商店** 刷新并安装，或：
-
-```http
-POST /v0/management/plugin-store/workbuddy/install
-```
-
-> 商店安装依赖 GitHub Release 资产；没有 Release 时能看到插件但安装会失败。本地编译后直接放文件更简单。
+把产物放到 CPA 的 `plugins/`（或 `plugins/<goos>/<goarch>/`），启用配置后重启，日志出现 `plugin loaded ... plugin_id=workbuddy` 即成功。
 
 ## 凭据
 
@@ -280,13 +310,12 @@ CPA 宿主本身支持 401/402/429 后冷却并换下一张 workbuddy 凭据，�
 
 若只有一条凭据且额度用尽，仍会返回 429；充值后冷却到期或重启后可再试。也可在面板里临时 `disabled: true` 那条凭据。
 
-## 发布
+## 发布 / 插件商店
 
-推送 tag 后 GitHub Actions（`.github/workflows/build.yml`）会构建多平台 zip + `checksums.txt` 并创建 Release：
-
-```bash
-git tag v0.3.0 && git push origin v0.3.0
-```
+1. 推送 tag：`git tag v0.3.0 && git push origin v0.3.0`
+2. GitHub Actions（`.github/workflows/build.yml`）构建多平台 zip + `checksums.txt` 并创建 Release
+3. 向 [CLIProxyAPI-Plugins-Store](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store) 提 PR，仅追加 `docs/plugin-store-entry.json` 中的条目到 `registry.json`（`repository` 必须是 `https://github.com/WslzGmzs/workbuddy-cli-proxy`）
+4. 之后只需打新 tag 发版，商店会读 latest release，无需每次改 registry
 
 规范摘要：
 
@@ -297,8 +326,6 @@ git tag v0.3.0 && git push origin v0.3.0
 | 资产名 | `workbuddy_<version>_<goos>_<goarch>.zip` |
 | zip 内容 | 根目录仅 `workbuddy.so` / `.dylib` / `.dll` |
 | 校验 | `checksums.txt`（sha256sum 格式） |
-
-发版后 `store-sources` 里的 `registry.json` 无需改动——商店读的是 latest release tag。
 
 ## License
 
