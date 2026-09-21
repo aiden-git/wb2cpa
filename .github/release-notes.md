@@ -62,7 +62,7 @@ plugins:
   enabled: true
   dir: "plugins"
   store-sources:
-    - "https://raw.githubusercontent.com/aiden-git/workbuddy-cli-proxy/main/registry.json"
+    - "https://raw.githubusercontent.com/aiden-git/wb2cpa/main/registry.json"
   configs:
     workbuddy: { enabled: true, priority: 100 }
 ```

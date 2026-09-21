@@ -4,8 +4,8 @@
   "description": "Wraps Tencent CodeBuddy (copilot.tencent.com) and WorkBuddy Global (www.workbuddy.ai) as a CLIProxyAPI provider. Supports QR/OAuth login, panel-paste or uploaded API-key credentials, CN and Global realm auto-routing, dynamic model discovery with CLI-allowlist filtering, Claude Code system-template sanitization (6 rules), tool-call pairing cleanup, hy3 max thinking, and true async streaming via host.stream.emit.",
   "author": "aiden-git",
   "version": "0.3.3",
-  "repository": "https://github.com/aiden-git/workbuddy-cli-proxy",
-  "homepage": "https://github.com/aiden-git/workbuddy-cli-proxy",
+  "repository": "https://github.com/aiden-git/wb2cpa",
+  "homepage": "https://github.com/aiden-git/wb2cpa",
   "license": "MIT",
   "tags": [
     "Provider",

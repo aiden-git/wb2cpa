@@ -7,12 +7,11 @@
 # `.github/release-notes.md`) in the repo and it is used verbatim; otherwise an
 # inline default is used. `${GITHUB_REF_NAME}` in the file expands to the tag.
 #
-# NOTE (fork limitation): GitHub does not trigger `push` workflows on forks, so
-# pushing a tag alone produces no release. After pushing the tag, dispatch the
-# workflow against that tag ref:
-#   gh workflow run Build --ref vX.Y.Z
-# That sets GITHUB_REF_TYPE=tag, so the version resolves correctly and the
-# release job's `startsWith(github.ref, 'refs/tags/v')` guard passes.
+# This repo is a standalone repository (not a fork), so pushing a `v*` tag
+# triggers the build and release automatically:
+#   git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z
+# (On a fork, tag pushes are not triggered — dispatch against the tag ref with
+# `gh workflow run Build --ref vX.Y.Z` instead.)
 
 name: Build
 
@@ -234,7 +233,7 @@ jobs:
             enabled: true
             dir: "plugins"
             store-sources:
-              - "https://raw.githubusercontent.com/aiden-git/workbuddy-cli-proxy/main/registry.json"
+              - "https://raw.githubusercontent.com/aiden-git/wb2cpa/main/registry.json"
             configs:
               workbuddy: { enabled: true, priority: 100 }
           ```

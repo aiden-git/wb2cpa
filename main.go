@@ -379,7 +379,7 @@ func wbRegistration() registration {
 			Name:             providerName,
 			Version:          pluginVersion,
 			Author:           "aiden-git (clean-room rebuild; original workbuddy by Sliverkiss)",
-			GitHubRepository: "https://github.com/aiden-git/workbuddy-cli-proxy",
+			GitHubRepository: "https://github.com/aiden-git/wb2cpa",
 		},
 		Capabilities: registrationCapability{
 			ModelProvider: true,

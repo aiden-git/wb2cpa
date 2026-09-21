@@ -1,10 +1,12 @@
-# workbuddy-cli-proxy
+# wb2cpa
 
 把**腾讯 CodeBuddy**（`copilot.tencent.com`）和 **WorkBuddy 国际版**（`www.workbuddy.ai`）封装成 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)（CPA）插件。任何支持 OpenAI / Anthropic 协议的客户端（Claude Code、Cursor、Cline、SDK……）都能直接调用 CodeBuddy 背后的模型。
 
 对 [Sliverkiss/cpa-plugin](https://github.com/Sliverkiss/cpa-plugin) 公开 `workbuddy.so` 的 clean-room 逆向重写，补齐了源码与多架构构建；workbuddy 的原始设计归属 Sliverkiss。
 
-插件 ID：`workbuddy` · 模块：`github.com/WslzGmzs/workbuddy-cli-proxy`
+插件 ID：`workbuddy` · 仓库：`wb2cpa` · 模块：`github.com/aiden-git/wb2cpa`
+
+> 仓库名 `wb2cpa` 意为「WorkBuddy → CLIProxyAPI」；插件在 CPA 内的运行时 ID 仍是 `workbuddy`。因此库文件名（`workbuddy.so`）、凭据里的 `"type": "workbuddy"`、`config.yaml` 的 `workbuddy:` 配置键都不变 —— 从旧仓库迁移无需改动任何部署配置。
 
 ## 工作原理
 
@@ -67,7 +69,7 @@ plugins:
   dir: "plugins"
   # 额外商店源：指向 raw registry.json（GitHub / 自建 HTTP 均可）
   store-sources:
-    - "https://raw.githubusercontent.com/aiden-git/workbuddy-cli-proxy/main/registry.json"
+    - "https://raw.githubusercontent.com/aiden-git/wb2cpa/main/registry.json"
   configs:
     workbuddy: { enabled: true, priority: 100 }
 ```
@@ -97,8 +99,8 @@ POST /v0/management/plugin-store/workbuddy/install
 **前置**：CLIProxyAPI v7.2.x（带 CGO / 插件支持）、Go 1.26+、gcc；架构与 CPA 一致。
 
 ```bash
-git clone https://github.com/aiden-git/workbuddy-cli-proxy.git
-cd workbuddy-cli-proxy
+git clone https://github.com/aiden-git/wb2cpa.git
+cd wb2cpa
 
 # 当前平台
 make build
@@ -312,30 +314,16 @@ CPA 宿主本身支持 401/402/429 后冷却并换下一张 workbuddy 凭据，�
 
 ## 发布 / 插件商店
 
-1. 更新版本号（`Makefile`、`main.go` 的 `pluginVersion`、`registry.json`、`docs/plugin-store-entry.json`），提交
-2. 推送 tag：
+1. 更新版本号（`Makefile`、`main.go` 的 `pluginVersion`、`registry.json`、`docs/plugin-store-entry.json`），提交并推送
+2. 打 tag 并推送 —— `wb2cpa` 是独立仓库（非 fork），tag push 会**自动**触发构建：
 
 ```bash
-git tag -a v0.3.4 -m "workbuddy v0.3.4" && git push origin v0.3.4
+git tag -a v0.3.4 -m "wb2cpa v0.3.4" && git push origin v0.3.4
 ```
 
-3. 触发构建（**fork 仓库必须这一步**）：
-
-```bash
-gh workflow run Build --ref v0.3.4
-```
-
-4. GitHub Actions（`.github/workflows/build.yml`）构建 6 个平台 zip + `checksums.txt` 并创建 Release
-5. （可选）向 [CLIProxyAPI-Plugins-Store](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store) 提 PR，追加 `docs/plugin-store-entry.json` 到其 `registry.json`——自用可跳过，直接用自己的 `store-sources` 即可
-6. 之后只需打新 tag 发版，商店会读 latest release，无需每次改 registry
-
-### ⚠️ fork 仓库的 tag 不会自动触发构建
-
-GitHub 对 **fork** 仓库默认不运行 `push` 触发的 workflow。只推 tag 会**静默失败**——没有构建、没有 release，商店安装时报找不到资产。
-
-解决办法就是上面第 3 步：用 `gh workflow run Build --ref <tag>` 在 tag ref 上手动派发。这样 `GITHUB_REF_TYPE=tag`，版本号能正确解析，release job 的 `startsWith(github.ref, 'refs/tags/v')` 判断也会通过。
-
-想根治的话，把仓库脱离 fork 状态（GitHub 设置里 detach fork，或另建一个非 fork 仓库），之后 tag push 即可自动触发。
+3. GitHub Actions（`.github/workflows/build.yml`）构建 6 个平台 zip + `checksums.txt` 并创建 Release
+4. （可选）向 [CLIProxyAPI-Plugins-Store](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store) 提 PR，追加 `docs/plugin-store-entry.json` 到其 `registry.json`——自用可跳过，直接用自己的 `store-sources` 即可
+5. 之后只需打新 tag 发版，商店会读 latest release，无需每次改 registry
 
 ### Release notes 自定义
 

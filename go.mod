@@ -1,4 +1,4 @@
-module github.com/WslzGmzs/workbuddy-cli-proxy
+module github.com/aiden-git/wb2cpa
 
 go 1.26.0
 

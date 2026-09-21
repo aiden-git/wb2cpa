@@ -1,10 +1,12 @@
-# AGENTS.md — workbuddy-cli-proxy
+# AGENTS.md — wb2cpa
 
 ## Purpose
 
 Clean-room Go rewrite of the **workbuddy** [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (CPA) plugin: wraps Tencent **CodeBuddy** (`copilot.tencent.com`) and **WorkBuddy Global** (`www.workbuddy.ai`) as an OpenAI-compatible provider for CPA. Original workbuddy design credited to Sliverkiss (`cpa-plugin`).
 
-Module: `github.com/WslzGmzs/workbuddy-cli-proxy` · Plugin ID: **`workbuddy`** · Go **1.26+** · depends on `CLIProxyAPI/v7` (plugin ABI/API only).
+Module: `github.com/aiden-git/wb2cpa` · Repo: **`wb2cpa`** · Plugin ID: **`workbuddy`** · Go **1.26+** · depends on `CLIProxyAPI/v7` (plugin ABI/API only).
+
+The repo was renamed from `workbuddy-cli-proxy` to `wb2cpa`, but the runtime plugin ID stays `workbuddy`: the shared library is still `workbuddy.so`, credential files still use `"type": "workbuddy"`, and `config.yaml` still keys under `workbuddy:`. Do **not** rename the plugin ID — it would break every existing deployment.
 
 ## Layout
 
@@ -36,12 +38,11 @@ go vet ./...
 go test ./...
 ```
 
-Release (⚠️ this repo is a **fork** — tag pushes do NOT trigger workflows, so
-dispatch against the tag ref after pushing it):
+Release — `wb2cpa` is a standalone repo (not a fork), so a `v*` tag push triggers
+the build and release automatically:
 
 ```bash
-git tag -a v0.3.4 -m "workbuddy v0.3.4" && git push origin v0.3.4
-gh workflow run Build --ref v0.3.4     # required on forks
+git tag -a v0.3.4 -m "wb2cpa v0.3.4" && git push origin v0.3.4
 ```
 
 Release notes: `.github/release-notes.md` (or `.github/release-notes-<tag>.md`)
@@ -171,7 +172,7 @@ API key management page (`/v0/resource/plugins/workbuddy/api-key`) supports ligh
 - Prefer helpers in `main.go` unless size forces a split.
 - Inject version with `-X main.pluginVersion=...` on release builds.
 - Keep `wbModels()` in sync with the actual upstream model set — it is the fallback when dynamic fetch fails.
-- Plugin store `repository` field must be exact `https://github.com/aiden-git/workbuddy-cli-proxy` (no trailing slash, no `.git`).
+- Plugin store `repository` field must be exact `https://github.com/aiden-git/wb2cpa` (no trailing slash, no `.git`).
 - Root `registry.json` is the private `store-sources` entry point; version field is display fallback only — real version comes from GitHub latest release tag `v*`.
 
 ## Docs to read first
