@@ -4,12 +4,12 @@
 #   make build
 #
 # Cross-ish local package (requires a C toolchain for GOOS/GOARCH):
-#   make package VERSION=0.2.0 GOOS=linux GOARCH=amd64
+#   make package VERSION=0.3.0 GOOS=linux GOARCH=amd64
 #
 # Plugin store asset name: workbuddy_<version>_<goos>_<goarch>.zip
 
 PLUGIN_ID ?= workbuddy
-VERSION   ?= 0.2.0
+VERSION   ?= 0.3.0
 GOOS      ?= $(shell go env GOOS)
 GOARCH    ?= $(shell go env GOARCH)
 
@@ -53,9 +53,8 @@ package: build
 vet:
 	go vet ./...
 
-# No unit tests yet; keep the target for CI symmetry with other CPA plugins.
 test:
-	@echo "no tests"
+	go test ./...
 
 clean:
 	rm -rf $(DIST_DIR) $(PLUGIN_ID)_*.zip $(PLUGIN_ID)_*.zip.sha256 checksums.txt *.so *.dylib *.dll *.h

@@ -6,8 +6,8 @@
 //
 //	go run ./.github/scripts/package-release.go \
 //	  -library dist/workbuddy.so \
-//	  -archive workbuddy_0.2.0_linux_amd64.zip \
-//	  -checksum workbuddy_0.2.0_linux_amd64.zip.sha256
+//	  -archive workbuddy_0.3.0_linux_amd64.zip \
+//	  -checksum workbuddy_0.3.0_linux_amd64.zip.sha256
 package main
 
 import (
