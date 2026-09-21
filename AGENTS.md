@@ -33,7 +33,7 @@ Requires **CGO** + C toolchain; GOOS/GOARCH must match the CPA host.
 
 ```bash
 make build                          # dist/workbuddy.<ext>
-make package VERSION=0.3.3 GOOS=linux GOARCH=amd64
+make package VERSION=0.4.0 GOOS=linux GOARCH=amd64
 go vet ./...
 go test ./...
 ```
@@ -42,7 +42,7 @@ Release — `wb2cpa` is a standalone repo (not a fork), so a `v*` tag push trigg
 the build and release automatically:
 
 ```bash
-git tag -a v0.3.4 -m "wb2cpa v0.3.4" && git push origin v0.3.4
+git tag -a v0.4.0 -m "wb2cpa v0.4.0" && git push origin v0.4.0
 ```
 
 Release notes: `.github/release-notes.md` (or `.github/release-notes-<tag>.md`)

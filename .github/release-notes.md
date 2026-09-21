@@ -1,8 +1,10 @@
-## workbuddy ${GITHUB_REF_NAME}
+## wb2cpa ${GITHUB_REF_NAME}
 
 CLIProxyAPI plugin for **Tencent CodeBuddy** (`copilot.tencent.com`) and **WorkBuddy Global** (`www.workbuddy.ai`).
 
-### 本次更新
+> **仓库迁移。** 本项目从 `aiden-git/workbuddy-cli-proxy` 迁到独立仓库 **`aiden-git/wb2cpa`**。插件运行时 ID 保持 `workbuddy` 不变，因此库文件名、凭据 `"type"`、`config.yaml` 配置键全部照旧 —— 部署无需任何改动，只需把 `store-sources` 的 URL 换成新仓库地址。
+
+### 主要功能
 
 #### 1. 国际版（Global realm）支持
 
@@ -96,10 +98,12 @@ For a Global account, set `"domain": "www.workbuddy.ai"` instead.
 
 Zip root contains only `workbuddy.so` / `.dylib` / `.dll` per platform:
 
-- `workbuddy_0.3.3_linux_amd64.zip`
-- `workbuddy_0.3.3_linux_arm64.zip`
-- `workbuddy_0.3.3_darwin_amd64.zip`
-- `workbuddy_0.3.3_darwin_arm64.zip`
-- `workbuddy_0.3.3_windows_amd64.zip`
-- `workbuddy_0.3.3_windows_arm64.zip`
+- `workbuddy_<version>_linux_amd64.zip`
+- `workbuddy_<version>_linux_arm64.zip`
+- `workbuddy_<version>_darwin_amd64.zip`
+- `workbuddy_<version>_darwin_arm64.zip`
+- `workbuddy_<version>_windows_amd64.zip`
+- `workbuddy_<version>_windows_arm64.zip`
 - `checksums.txt` (sha256sum format)
+
+Where `<version>` is `${GITHUB_REF_NAME}` with the leading `v` stripped.
