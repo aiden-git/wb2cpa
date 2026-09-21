@@ -45,6 +45,9 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Test
+        run: go test ./...
+
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
     needs: vet

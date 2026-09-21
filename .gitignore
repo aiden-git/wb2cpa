@@ -17,6 +17,7 @@ workbuddy.json
 /vendor/
 
 # 本地编辑器/系统
+.zcode/
 .DS_Store
 *.swp
 .idea/

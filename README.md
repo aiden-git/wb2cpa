@@ -16,6 +16,8 @@
 - **手动 API Key** 凭据（上传 JSON 即可）
 - 请求转发到上游 `/v2/chat/completions`（CN / 国际版自动路由）
 - 模型列表从上游**动态拉取**（1 小时缓存），失败时降级到内置静态列表
+- **WorkBuddy 管理页**：脱敏账户概览、套餐、OAuth 积分余额、模型积分倍率与能力标签
+- 管理页支持**国内版与国际版 OAuth 登录**；通用 CPA OAuth 卡片为兼容现有流程仍默认国内版
 
 ## Realm（CN / 国际版）
 
@@ -30,7 +32,7 @@ OAuth 登录后 `domain` 由服务端下发；API Key 模式在凭据 JSON 里�
 
 ## 模型
 
-模型列表**从上游动态拉取**，每张凭据独立缓存（成功 1 小时 / 失败 5 分钟）。上游返回的模型会经过以下过滤后呈现给 CPA：
+模型列表**从上游动态拉取**，按 realm 缓存（成功 1 小时 / 失败 5 分钟）。上游返回的模型会经过以下过滤后呈现给 CPA：
 
 - 仅保留 CLI Agent 白名单内的模型
 - 过滤掉 embedding / 代码补全 / 图像生成类模型（`nes-` / `completion-` / `codewise-` 前缀；`maxOutputTokens ≤ 256`；`text-to-image` 标签）
@@ -54,7 +56,7 @@ OAuth 登录后 `domain` 由服务端下发；API Key 模式在凭据 JSON 里�
 - `checksums.txt`（sha256sum 格式）
 
 ```bash
-git tag v0.4.0 && git push origin v0.4.0
+git tag v0.5.0 && git push origin v0.5.0
 ```
 
 没有 Release 资产时，商店能看到插件，但安装会失败。
@@ -107,14 +109,14 @@ make build
 # → dist/workbuddy.so | .dylib | .dll
 
 # 指定平台并打成商店兼容 zip
-make package VERSION=0.4.0 GOOS=linux GOARCH=amd64
+make package VERSION=0.5.0 GOOS=linux GOARCH=amd64
 ```
 
 也可手写：
 
 ```bash
 CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-  go build -buildmode=c-shared -ldflags "-s -w -X main.pluginVersion=0.4.0" \
+  go build -buildmode=c-shared -ldflags "-s -w -X main.pluginVersion=0.5.0" \
   -o workbuddy.so .
 ```
 
@@ -122,23 +124,43 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
 
 ## 凭据
 
-### 1. 扫码 / OAuth（面板登录）
+### 1. 管理页 OAuth 登录（国内版 / 国际版）
 
-CPA 管理界面添加 workbuddy 凭据 → 扫码登录 CodeBuddy。登录后由宿主持久化（形态与 `workbuddy.json` 兼容）。
+打开下面的 WorkBuddy 管理页，填写 Management Token 后，在 **OAuth 登录** 标签选择：
 
-### 2. 管理页 / API 添加 API Key（推荐）
+- **登录国内版（CodeBuddy）**：`copilot.tencent.com`
+- **登录国际版（WorkBuddy）**：`www.workbuddy.ai`
 
-CPA 自带的 OAuth「回调 URL / 授权码」框 **不能** 用来贴 Key：宿主接口 `/v0/management/oauth-callback` 要求 `state` + `code`，面板常把内容塞进 `redirect_url` 且不带 `state`，请求在进插件前就被拒（`state is required`）。扫码登录不受影响。
+页面会打开对应区域的授权页、轮询登录状态，并通过 CPA 的 `host.auth.save` 保存凭据。CPA 通用 OAuth 卡片仍可用，但它为兼容性默认发起国内版登录。
 
-#### 管理菜单
+### 2. 账户概览、套餐和积分余额
 
-加载插件后，管理端会出现 **WorkBuddy API Key**（资源路径）：
+管理页的 **账户概览** 标签会为每张 WorkBuddy 凭据显示账号标识（UID 脱敏）、区域、启用状态、套餐类型、套餐积分余额、CN 企业额度（如有）、计费周期，以及动态模型的倍率和能力。
+
+- 套餐/余额只为 **OAuth** 凭据查询：CN 账单请求走 `https://www.codebuddy.cn`，国际版走 `https://www.workbuddy.ai`。
+- **API Key** 凭据会明确显示“暂不支持套餐与积分余额查询”，而不是误报为零。
+- Token、API Key、完整认证文件和原始账单响应不会输出到浏览器、页面或 API 响应；账户结果仅缓存在插件内存中（成功 3 分钟，失败 30 秒）。
+
+路径：
 
 ```text
 https://<cpa-host>/v0/resource/plugins/workbuddy/api-key
 ```
 
-填写 Management Token + CodeBuddy API Key 即可保存。
+可通过管理 API 获取或刷新脱敏摘要：
+
+```text
+GET  /v0/management/workbuddy/accounts
+POST /v0/management/workbuddy/accounts/refresh
+```
+
+### 3. 管理页 / API 添加 API Key
+
+CPA 自带的 OAuth「回调 URL / 授权码」框 **不能** 用来贴 Key：宿主接口 `/v0/management/oauth-callback` 要求 `state` + `code`，面板常把内容塞进 `redirect_url` 且不带 `state`，请求在进插件前就被拒（`state is required`）。扫码登录不受影响。
+
+#### 管理菜单
+
+加载插件后，管理端会出现 **WorkBuddy 管理**。在 **添加 API Key** 标签填写 Management Token 与 Key 即可保存；旧的资源路径保持兼容。
 
 #### HTTP API（需 management Bearer）
 
@@ -151,7 +173,7 @@ curl -X POST 'https://<cpa-host>/v0/management/workbuddy/api-key' \
 
 成功返回 `{"status":"ok","fileName":"workbuddy-key-....json",...}`，凭据经 `host.auth.save` 写入 CPA auth 目录。
 
-### 3. 上传 auth JSON 文件
+### 4. 上传 auth JSON 文件
 
 #### CN 账号（默认）
 
@@ -318,7 +340,7 @@ CPA 宿主本身支持 401/402/429 后冷却并换下一张 workbuddy 凭据，�
 2. 打 tag 并推送 —— `wb2cpa` 是独立仓库（非 fork），tag push 会**自动**触发构建：
 
 ```bash
-git tag -a v0.4.0 -m "wb2cpa v0.4.0" && git push origin v0.4.0
+git tag -a v0.5.0 -m "wb2cpa v0.5.0" && git push origin v0.5.0
 ```
 
 3. GitHub Actions（`.github/workflows/build.yml`）构建 6 个平台 zip + `checksums.txt` 并创建 Release
@@ -334,7 +356,7 @@ git tag -a v0.4.0 -m "wb2cpa v0.4.0" && git push origin v0.4.0
 | 项 | 要求 |
 |----|------|
 | 插件 ID | `workbuddy`（与文件名 / zip 内库名一致） |
-| Release tag | `v<version>`，如 `v0.4.0` |
+| Release tag | `v<version>`，如 `v0.5.0` |
 | 资产名 | `workbuddy_<version>_<goos>_<goarch>.zip` |
 | zip 内容 | 根目录仅 `workbuddy.so` / `.dylib` / `.dll` |
 | 校验 | `checksums.txt`（sha256sum 格式） |

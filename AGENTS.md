@@ -16,6 +16,7 @@ The repo was renamed from `workbuddy-cli-proxy` to `wb2cpa`, but the runtime plu
 | `features_test.go` | Tests for sanitize, tool-call cleanup, realm helpers, model filters |
 | `model_rewrite_test.go` | Tests for model id rewrite / alias / prefix / thinking logic |
 | `upstream_error_test.go` | Tests for statusError, quota exhaustion, RetryAfter |
+| `management_test.go` | Tests for account overview redaction, billing realm, model multiplier projection |
 | `go.mod` / `go.sum` | Module + CPA SDK pin |
 | `Makefile` | Local `build` / `package` (store-compatible zip) |
 | `.github/workflows/build.yml` | Multi-arch CGO build + GitHub Release |
@@ -33,7 +34,7 @@ Requires **CGO** + C toolchain; GOOS/GOARCH must match the CPA host.
 
 ```bash
 make build                          # dist/workbuddy.<ext>
-make package VERSION=0.4.0 GOOS=linux GOARCH=amd64
+make package VERSION=0.5.0 GOOS=linux GOARCH=amd64
 go vet ./...
 go test ./...
 ```
@@ -42,7 +43,7 @@ Release — `wb2cpa` is a standalone repo (not a fork), so a `v*` tag push trigg
 the build and release automatically:
 
 ```bash
-git tag -a v0.4.0 -m "wb2cpa v0.4.0" && git push origin v0.4.0
+git tag -a v0.5.0 -m "wb2cpa v0.5.0" && git push origin v0.5.0
 ```
 
 Release notes: `.github/release-notes.md` (or `.github/release-notes-<tag>.md`)
@@ -73,8 +74,9 @@ Provider id: `workbuddy`. C exports: `cliproxy_plugin_init`, `cliproxyPluginCall
 | `isGlobal(sa)` | bool; wraps `isGlobalDomain` on `sa.Auth.Domain` / `sa.Domain` |
 | `chatEndpointFor(sa)` | global: `https://www.workbuddy.ai/v2/chat/completions`; CN: `endpointChat` |
 | `modelsEndpointFor(sa)` | global: `/v2/enterprises/personal/models`; CN: `/console/enterprises/personal/models` |
+| `billingBaseFor(sa)` | global: `https://www.workbuddy.ai`; CN: `https://www.codebuddy.cn` |
 
-`commonHeadersFor(req, isGlb)` switches `Origin` / `Referer` between `cnOrigin` and `globalOrigin`.
+`commonHeadersFor(req, isGlb)` switches `Origin` / `Referer` between `cnOrigin` and `globalOrigin`. OAuth state/token/account/refresh endpoints use the realm that issued the login state or that is stored on the credential.
 
 `backendHeaders` branches on realm:
 - Global: `X-No-Enterprise-Id: 1` + `X-Domain: www.workbuddy.ai` (no enterprise concept)
@@ -90,7 +92,13 @@ Cache: `modelCacheMu` + `modelCacheMap` keyed by `"cn"` / `"global"`.  TTLs: 1 h
 
 `nonChatModel(e)` rejects: `nes-` / `completion-` / `codewise-` prefix; `maxOutputTokens` 1–256; `text-to-image` tag.
 
-`handleModelsForAuth` calls `fetchDynamicModels` with cache fallback to `wbModels()` on error or empty.
+`handleModelsForAuth` calls `fetchDynamicModels` with cache fallback to `wbModels()` on error or empty. The cached `dynModelEntry` values preserve `credits` and capability flags for the management overview; they never alter CPA model registration.
+
+### Account overview and management
+
+The browser resource remains `/v0/resource/plugins/workbuddy/api-key` for compatibility, but is now the **WorkBuddy 管理** page with account cards, API-key creation, and explicit CN/Global OAuth buttons. Its authenticated management routes are `/workbuddy/accounts`, `/workbuddy/accounts/refresh`, `/workbuddy/oauth/start`, `/workbuddy/oauth/poll`, and `/workbuddy/api-key`.
+
+`listAccountSummaries` reads credentials through `host.auth.list` and `host.auth.get` only on the plugin side. It returns display-only `accountSummary` data: UID is masked; API keys, OAuth tokens, storage JSON, and raw billing responses must never enter the cache, browser JSON, HTML, error strings, or logs. OAuth balance/plan queries cache for 3 minutes (errors 30 seconds); API-key credentials explicitly report that balance queries are unsupported.
 
 ### Request rewriting (`rewriteSystemForUpstream`)
 
@@ -148,7 +156,7 @@ Models are **auth-bound only** (`ExecutorModelScopeOAuth`): `model.static` is em
 
 Refresh merges host `Metadata`/`Attributes` when storage omitted the fields (`applyHostCredentialFields`).
 
-API key management page (`/v0/resource/plugins/workbuddy/api-key`) supports light/dark (`prefers-color-scheme` + manual toggle).
+The WorkBuddy management page (`/v0/resource/plugins/workbuddy/api-key`) combines account overview, CN/Global OAuth, and API-key creation; it supports light/dark (`prefers-color-scheme` + manual toggle).
 
 ## Gotchas (do not "simplify" away)
 
@@ -163,8 +171,9 @@ API key management page (`/v0/resource/plugins/workbuddy/api-key`) supports ligh
 9. **Credentials** — never log/commit `workbuddy.json` or API keys.
 10. **Store packaging** — zip must contain **only** `workbuddy.<ext>` at root; asset name `workbuddy_<ver>_<goos>_<goarch>.zip`.
 11. **API key vs OAuth** — do not send refresh headers for api_key mode (`X-Refresh-Token` belongs only in `handleRefreshAuth`, not `backendHeaders`); do not require `accessToken` when `api_key` is set.
-12. **Realm routing** — always derive the upstream URL via `chatEndpointFor(sa)` / `modelsEndpointFor(sa)`; never hardcode `endpointChat` at call sites. Auth endpoints (login/refresh) always hit the CN base regardless of realm.
-13. **Dynamic model cache** — `modelCacheMu` guards `modelCacheMap`; lock only for read/write of the map, not for the HTTP fetch itself. On fetch failure store an error entry (5 min TTL) to avoid hammering upstream on every request.
+12. **Realm routing** — always derive chat/models URLs via `chatEndpointFor(sa)` / `modelsEndpointFor(sa)` and billing URLs via `billingBaseFor(sa)`; never hardcode `endpointChat` at call sites. OAuth state, poll/account, and refresh requests must use their issuing/stored realm.
+13. **Account privacy** — account overview APIs are management-authenticated and display-only. Never expose `api_key`, `apiKey`, access/refresh tokens, raw credential storage, or raw billing bodies; do not use API-key accounts to fabricate a zero balance.
+14. **Dynamic model cache** — `modelCacheMu` guards `modelCacheMap`; lock only for read/write of the map, not for the HTTP fetch itself. On fetch failure store an error entry (5 min TTL) to avoid hammering upstream on every request.
 14. **Tool-call pairing** — `repackToolResultBlocks` runs before `cleanupOrphanToolCalls`; order matters (repack first so orphan detection sees clean blocks).
 
 ## Conventions

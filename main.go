@@ -80,8 +80,8 @@ import (
 
 // pluginVersion is injected at link time for release builds:
 //
-//	-ldflags "-X main.pluginVersion=0.4.0"
-var pluginVersion = "0.4.0"
+//	-ldflags "-X main.pluginVersion=0.5.0"
+var pluginVersion = "0.5.0"
 
 const (
 	providerName   = "workbuddy"
@@ -99,11 +99,11 @@ const (
 	globalBase   = "https://www.workbuddy.ai"
 	globalOrigin = "https://www.workbuddy.ai"
 
-	// CN auth endpoints (login/refresh always hit CN regardless of realm)
-	endpointAuthState    = upstreamBase + "/v2/plugin/auth/state?platform=CLI"
-	endpointLoginAcct    = upstreamBase + "/v2/plugin/login/account?state="
-	endpointAuthToken    = upstreamBase + "/v2/plugin/auth/token?state="
-	endpointTokenRefresh = upstreamBase + "/v2/plugin/auth/token/refresh"
+	// OAuth endpoints are realm-dependent; use the auth*EndpointFor helpers.
+	authStatePath    = "/v2/plugin/auth/state?platform=CLI"
+	loginAccountPath = "/v2/plugin/login/account?state="
+	authTokenPath    = "/v2/plugin/auth/token?state="
+	tokenRefreshPath = "/v2/plugin/auth/token/refresh"
 
 	// Chat endpoint (realm-dependent; use chatEndpointFor(sa) at call sites)
 	endpointChat = upstreamBase + "/v2/chat/completions"
@@ -112,8 +112,8 @@ const (
 	cnModelsPath     = "/console/enterprises/personal/models"
 	globalModelsPath = "/v2/enterprises/personal/models"
 
-	loginTTL        = 5 * time.Minute
-	modelCacheTTL   = 60 * time.Minute
+	loginTTL         = 5 * time.Minute
+	modelCacheTTL    = 60 * time.Minute
 	modelCacheErrTTL = 5 * time.Minute
 )
 
@@ -123,6 +123,7 @@ const (
 type loginCtx struct {
 	client  *http.Client
 	expires time.Time
+	global  bool
 }
 
 var (
@@ -132,15 +133,74 @@ var (
 	sharedClient   *http.Client
 
 	// Per-realm dynamic model cache (keyed by "cn" or "global").
-	modelCacheMu    sync.Mutex
-	modelCacheMap   = map[string]*modelCacheEntry{}
+	modelCacheMu  sync.Mutex
+	modelCacheMap = map[string]*modelCacheEntry{}
+
+	accountCacheMu  sync.Mutex
+	accountCacheMap = map[string]*accountCacheEntry{}
+
+	// Kept as an indirection so management handlers are unit-testable without a
+	// cgo host callback table. Production always uses hostCall.
+	hostCallFn = hostCall
 )
 
 // modelCacheEntry holds a cached model list with a TTL.
 type modelCacheEntry struct {
 	models    []pluginapi.ModelInfo
+	details   []dynModelEntry // display metadata: credits and capability flags
 	fetchedAt time.Time
 	isError   bool // true → cached failure; use shorter TTL
+}
+
+const (
+	accountCacheTTL    = 3 * time.Minute
+	accountCacheErrTTL = 30 * time.Second
+)
+
+// accountSummary is deliberately a display-only projection. It never contains
+// API keys, OAuth tokens, raw upstream responses, or the credential storage JSON.
+type accountSummary struct {
+	ID          string         `json:"id"`
+	Label       string         `json:"label"`
+	Nickname    string         `json:"nickname,omitempty"`
+	UID         string         `json:"uid,omitempty"`
+	Realm       string         `json:"realm"`
+	AuthType    string         `json:"auth_type"`
+	Disabled    bool           `json:"disabled"`
+	Plan        string         `json:"plan,omitempty"`
+	Balance     *creditSummary `json:"balance,omitempty"`
+	Enterprise  *creditSummary `json:"enterprise,omitempty"`
+	CycleStart  string         `json:"cycle_start,omitempty"`
+	CycleEnd    string         `json:"cycle_end,omitempty"`
+	Models      []modelSummary `json:"models,omitempty"`
+	UpdatedAt   time.Time      `json:"updated_at"`
+	Error       string         `json:"error,omitempty"`
+	Unsupported bool           `json:"unsupported,omitempty"`
+}
+
+type creditSummary struct {
+	Remaining float64 `json:"remaining"`
+	Used      float64 `json:"used"`
+	Total     float64 `json:"total"`
+	Unit      string  `json:"unit"`
+}
+
+type modelSummary struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Credits   string `json:"credits,omitempty"`
+	Context   int64  `json:"context"`
+	MaxOutput int64  `json:"max_output"`
+	Images    bool   `json:"images"`
+	Reasoning bool   `json:"reasoning"`
+	ToolCall  bool   `json:"tool_call"`
+	Disabled  bool   `json:"disabled"`
+}
+
+type accountCacheEntry struct {
+	summary   accountSummary
+	fetchedAt time.Time
+	isError   bool
 }
 
 func main() {}
@@ -309,43 +369,43 @@ type envelope struct {
 }
 
 type envelopeError struct {
-		Code       string `json:"code"`
-		Message    string `json:"message"`
-		Retryable  bool   `json:"retryable,omitempty"`
-		HTTPStatus int    `json:"http_status,omitempty"`
-	}
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	Retryable  bool   `json:"retryable,omitempty"`
+	HTTPStatus int    `json:"http_status,omitempty"`
+}
 
-	// statusError implements CPA cliproxyexecutor.StatusError (StatusCode) and
-	// optional RetryAfter so the host can cool down / fail over credentials.
-	type statusError struct {
-		Message      string
-		Code         string
-		HTTPStatus   int
-		retryAfter   *time.Duration
-		Retryable    bool
-	}
+// statusError implements CPA cliproxyexecutor.StatusError (StatusCode) and
+// optional RetryAfter so the host can cool down / fail over credentials.
+type statusError struct {
+	Message    string
+	Code       string
+	HTTPStatus int
+	retryAfter *time.Duration
+	Retryable  bool
+}
 
-	func (e *statusError) Error() string {
-		if e == nil {
-			return "workbuddy error"
-		}
-		return e.Message
+func (e *statusError) Error() string {
+	if e == nil {
+		return "workbuddy error"
 	}
+	return e.Message
+}
 
-	func (e *statusError) StatusCode() int {
-		if e == nil {
-			return 0
-		}
-		return e.HTTPStatus
+func (e *statusError) StatusCode() int {
+	if e == nil {
+		return 0
 	}
+	return e.HTTPStatus
+}
 
-	// RetryAfter is the method name CPA retryAfterFromError looks for.
-	func (e *statusError) RetryAfter() *time.Duration {
-		if e == nil {
-			return nil
-		}
-		return e.retryAfter
+// RetryAfter is the method name CPA retryAfterFromError looks for.
+func (e *statusError) RetryAfter() *time.Duration {
+	if e == nil {
+		return nil
 	}
+	return e.retryAfter
+}
 
 type identifierResponse struct {
 	Identifier string `json:"identifier"`
@@ -550,8 +610,11 @@ func fetchDynamicModels(sa *storedAuth) ([]pluginapi.ModelInfo, error) {
 	}
 	hasCLIList := len(cliAllowlist) > 0
 
-	// Convert to ModelInfo, filtering by allowlist + nonChatModel.
+	// Convert to ModelInfo, filtering by allowlist + nonChatModel. Keep the
+	// upstream metadata too: the management view uses it for credit multipliers
+	// and capability badges without making a second models request.
 	var result []pluginapi.ModelInfo
+	var details []dynModelEntry
 	for _, e := range envelope.Data.Models {
 		if e.Disabled {
 			continue
@@ -587,12 +650,17 @@ func fetchDynamicModels(sa *storedAuth) ([]pluginapi.ModelInfo, error) {
 			MaxCompletionTokens:        maxOut,
 			UserDefined:                true,
 		})
+		e.MaxInputTokens = ctx
+		e.MaxOutputTokens = maxOut
+		e.Name = name
+		details = append(details, e)
 	}
 
 	// Cache success.
 	modelCacheMu.Lock()
 	modelCacheMap[cacheKey] = &modelCacheEntry{
 		models:    result,
+		details:   details,
 		fetchedAt: time.Now(),
 		isError:   false,
 	}
@@ -1229,6 +1297,229 @@ func modelsEndpointFor(sa *storedAuth) string {
 	return upstreamBase + cnModelsPath
 }
 
+func authBaseForGlobal(global bool) string {
+	if global {
+		return globalBase
+	}
+	return upstreamBase
+}
+
+func authStateEndpointFor(global bool) string {
+	return authBaseForGlobal(global) + authStatePath
+}
+
+func loginAccountEndpointFor(global bool, state string) string {
+	return authBaseForGlobal(global) + loginAccountPath + state
+}
+
+func authTokenEndpointFor(global bool, state string) string {
+	return authBaseForGlobal(global) + authTokenPath + state
+}
+
+func tokenRefreshEndpointFor(sa *storedAuth) string {
+	return authBaseForGlobal(isGlobal(sa)) + tokenRefreshPath
+}
+
+func domainForGlobal(global bool) string {
+	if global {
+		return "www.workbuddy.ai"
+	}
+	return "copilot.tencent.com"
+}
+
+// billingBaseFor deliberately differs from the CN chat/auth base. CodeBuddy
+// serves billing from www.codebuddy.cn while Global uses workbuddy.ai for both.
+func billingBaseFor(sa *storedAuth) string {
+	if isGlobal(sa) {
+		return globalBase
+	}
+	return cnOrigin
+}
+
+func billingHeaders(req *http.Request, sa *storedAuth) {
+	commonHeadersFor(req, isGlobal(sa))
+	req.Header.Set("Accept", "application/json")
+	if sa == nil || sa.isAPIKey() || strings.TrimSpace(sa.Auth.AccessToken) == "" {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+sa.Auth.AccessToken)
+	if uid := firstNonEmpty(sa.Account.UID, sa.UserID); uid != "" {
+		req.Header.Set("X-User-Id", uid)
+	}
+	if isGlobal(sa) {
+		req.Header.Set("X-Domain", "www.workbuddy.ai")
+		return
+	}
+	enterpriseID := firstNonEmpty(sa.Account.EnterpriseID, sa.EnterpriseID)
+	if enterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", enterpriseID)
+		req.Header.Set("X-Tenant-Id", enterpriseID)
+	}
+	req.Header.Set("X-Domain", firstNonEmpty(sa.Auth.Domain, sa.Domain, "copilot.tencent.com"))
+}
+
+type flexibleFloat float64
+
+func (f *flexibleFloat) UnmarshalJSON(raw []byte) error {
+	var n float64
+	if err := json.Unmarshal(raw, &n); err == nil {
+		*f = flexibleFloat(n)
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return err
+	}
+	n, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil {
+		return err
+	}
+	*f = flexibleFloat(n)
+	return nil
+}
+
+type billingPackage struct {
+	PackageName         string        `json:"PackageName"`
+	CapacityRemain      flexibleFloat `json:"CapacityRemain"`
+	CapacityUsed        flexibleFloat `json:"CapacityUsed"`
+	CapacitySize        flexibleFloat `json:"CapacitySize"`
+	CycleCapacityRemain flexibleFloat `json:"CycleCapacityRemain"`
+	CycleCapacityUsed   flexibleFloat `json:"CycleCapacityUsed"`
+	CycleCapacitySize   flexibleFloat `json:"CycleCapacitySize"`
+	CycleStartTime      string        `json:"CycleStartTime"`
+	CycleEndTime        string        `json:"CycleEndTime"`
+}
+
+type billingResourceData struct {
+	Response struct {
+		Data struct {
+			Accounts []billingPackage `json:"Accounts"`
+		} `json:"Data"`
+	} `json:"Response"`
+}
+
+func fetchBillingData(sa *storedAuth, path string, request any, target any) error {
+	if sa == nil || sa.isAPIKey() {
+		return fmt.Errorf("billing is unavailable for API key credentials")
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	data, _, err := doJSON(httpClientForAuth(sa), http.MethodPost, billingBaseFor(sa)+path, func(req *http.Request) {
+		billingHeaders(req, sa)
+	}, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("billing request failed")
+	}
+	if err := json.Unmarshal(data, target); err != nil {
+		return fmt.Errorf("billing response parse failed")
+	}
+	return nil
+}
+
+func fetchPaymentType(sa *storedAuth) (string, error) {
+	var response struct {
+		PaymentType any `json:"paymentType"`
+	}
+	if err := fetchBillingData(sa, "/v2/billing/meter/get-payment-type", map[string]any{}, &response); err != nil {
+		return "", err
+	}
+	switch value := response.PaymentType.(type) {
+	case string:
+		return strings.TrimSpace(value), nil
+	case float64:
+		return strconv.FormatFloat(value, 'f', -1, 64), nil
+	default:
+		return "", nil
+	}
+}
+
+func fetchUserResource(sa *storedAuth, now time.Time) (*creditSummary, string, string, error) {
+	request := map[string]any{
+		"PageNumber":               1,
+		"PageSize":                 100,
+		"ProductCode":              "p_tcaca",
+		"Status":                   []int{0, 3},
+		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
+		"PackageEndTimeRangeEnd":   now.AddDate(101, 0, 0).Format("2006-01-02 15:04:05"),
+	}
+	var response billingResourceData
+	if err := fetchBillingData(sa, "/v2/billing/meter/get-user-resource", request, &response); err != nil {
+		return nil, "", "", err
+	}
+	var selected *billingPackage
+	for i := range response.Response.Data.Accounts {
+		candidate := &response.Response.Data.Accounts[i]
+		if candidate.CycleCapacitySize > 0 || candidate.CapacitySize > 0 {
+			selected = candidate
+			break
+		}
+	}
+	if selected == nil {
+		return nil, "", "", nil
+	}
+	remaining, used, total := selected.CapacityRemain, selected.CapacityUsed, selected.CapacitySize
+	if selected.CycleCapacitySize > 0 {
+		remaining, used, total = selected.CycleCapacityRemain, selected.CycleCapacityUsed, selected.CycleCapacitySize
+	}
+	return &creditSummary{Remaining: float64(remaining), Used: float64(used), Total: float64(total), Unit: "credits"}, selected.CycleStartTime, selected.CycleEndTime, nil
+}
+
+func fetchEnterpriseUsageCN(sa *storedAuth) (*creditSummary, string, string, error) {
+	if sa == nil || isGlobal(sa) || firstNonEmpty(sa.Account.EnterpriseID, sa.EnterpriseID) == "" {
+		return nil, "", "", nil
+	}
+	var response struct {
+		Credit         flexibleFloat `json:"credit"`
+		LimitNum       flexibleFloat `json:"limitNum"`
+		CycleStartTime string        `json:"cycleStartTime"`
+		CycleEndTime   string        `json:"cycleEndTime"`
+	}
+	if err := fetchBillingData(sa, "/billing/meter/get-enterprise-user-usage", map[string]any{}, &response); err != nil {
+		return nil, "", "", err
+	}
+	return &creditSummary{Remaining: float64(response.Credit), Total: float64(response.LimitNum), Used: float64(response.LimitNum - response.Credit), Unit: "credits"}, response.CycleStartTime, response.CycleEndTime, nil
+}
+
+func maskAccountIdentifier(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= 4 {
+		return value
+	}
+	if len(value) <= 8 {
+		return value[:2] + "…" + value[len(value)-2:]
+	}
+	return value[:3] + "…" + value[len(value)-4:]
+}
+
+func modelSummariesFor(sa *storedAuth) []modelSummary {
+	key := "cn"
+	if isGlobal(sa) {
+		key = "global"
+	}
+	modelCacheMu.Lock()
+	entry := modelCacheMap[key]
+	var details []dynModelEntry
+	if entry != nil && !entry.isError && time.Since(entry.fetchedAt) < modelCacheTTL {
+		details = append(details, entry.details...)
+	}
+	modelCacheMu.Unlock()
+	if len(details) == 0 {
+		_, _ = fetchDynamicModels(sa)
+		modelCacheMu.Lock()
+		if entry = modelCacheMap[key]; entry != nil && !entry.isError {
+			details = append(details, entry.details...)
+		}
+		modelCacheMu.Unlock()
+	}
+	out := make([]modelSummary, 0, len(details))
+	for _, model := range details {
+		out = append(out, modelSummary{ID: model.ID, Name: firstNonEmpty(model.Name, model.ID), Credits: model.Credits, Context: model.MaxInputTokens, MaxOutput: model.MaxOutputTokens, Images: model.SupportsImages, Reasoning: model.SupportsReasoning, ToolCall: model.SupportsToolCall, Disabled: model.Disabled})
+	}
+	return out
+}
+
 // backendHeaders applies auth-derived headers to a chat completion request.
 // Empty fields are signalled via the X-No-* convention used by CodeBuddy.
 // API-key mode sends both Authorization Bearer and X-API-Key (CodeBuddy accepts either).
@@ -1509,36 +1800,45 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 }
 
 func handleStartLogin(raw []byte) ([]byte, error) {
-	// Host may pass AuthDir / callback base via the start request; keep for poll metadata.
+	// The generic CPA OAuth card has no realm selector, so preserve its historical
+	// CN default. The WorkBuddy management page starts Global login explicitly.
 	var startReq pluginapi.AuthLoginStartRequest
 	_ = json.Unmarshal(raw, &startReq)
-
-	client := newLoginClient()
-	data, _, err := doJSON(client, http.MethodPost, endpointAuthState, nil, bytes.NewReader([]byte("{}")))
+	response, err := startLoginForRealm(startReq, false)
 	if err != nil {
-		return nil, fmt.Errorf("auth state failed: %w", err)
+		return nil, err
+	}
+	return okEnvelope(response)
+}
+
+func startLoginForRealm(startReq pluginapi.AuthLoginStartRequest, global bool) (pluginapi.AuthLoginStartResponse, error) {
+	client := newLoginClient()
+	headers := func(r *http.Request) { commonHeadersFor(r, global) }
+	data, _, err := doJSON(client, http.MethodPost, authStateEndpointFor(global), headers, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("auth state failed: %w", err)
 	}
 	var st authStateData
 	_ = json.Unmarshal(data, &st)
 	if st.State == "" || st.AuthURL == "" {
-		return nil, fmt.Errorf("auth state: missing state or authUrl")
+		return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("auth state: missing state or authUrl")
 	}
-	loginStates.Store(st.State, &loginCtx{client: client, expires: time.Now().Add(loginTTL)})
+	expiresAt := time.Now().Add(loginTTL)
+	loginStates.Store(st.State, &loginCtx{client: client, expires: expiresAt, global: global})
 	meta := map[string]any{
-		// Hint for operators / logs: the CPA "callback URL / auth code" box
-		// can paste a CodeBuddy API key (non-URL) to finish without QR.
+		"realm":      map[bool]string{false: "cn", true: "global"}[global],
 		"paste_hint": "Paste CodeBuddy API key in the callback/code box, or complete QR login.",
 	}
 	if dir := strings.TrimSpace(startReq.Host.AuthDir); dir != "" {
 		meta["auth_dir"] = dir
 	}
-	return okEnvelope(pluginapi.AuthLoginStartResponse{
+	return pluginapi.AuthLoginStartResponse{
 		Provider:  providerName,
 		URL:       st.AuthURL,
 		State:     st.State,
-		ExpiresAt: time.Now().Add(loginTTL).UTC(),
+		ExpiresAt: expiresAt.UTC(),
 		Metadata:  meta,
-	})
+	}, nil
 }
 
 func handlePollLogin(raw []byte) ([]byte, error) {
@@ -1598,8 +1898,10 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 	// layer returns code 11217 ("login ing") while pending, and code 0 with the
 	// token bundle once complete. login/account sits behind the openresty gateway
 	// and is rejected (401) until login finishes, so probe token first and only
-	// fetch account once we hold a bearer.
-	tokRaw, _, errTok := doJSON(lc.client, http.MethodGet, endpointAuthToken+state, nil, nil)
+	// fetch account once we hold a bearer. Every request stays on the realm that
+	// issued this state; Global-issued JWTs are rejected by the CN gateway.
+	realmHeaders := func(r *http.Request) { commonHeadersFor(r, lc.global) }
+	tokRaw, _, errTok := doJSON(lc.client, http.MethodGet, authTokenEndpointFor(lc.global, state), realmHeaders, nil)
 	if errTok != nil {
 		return okEnvelope(pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusPending,
@@ -1616,13 +1918,17 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 
 	var acct accountData
 	acctHeaders := func(r *http.Request) {
-		commonHeaders(r)
+		commonHeadersFor(r, lc.global)
 		r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 	}
-	if acctRaw, _, errAcct := doJSON(lc.client, http.MethodGet, endpointLoginAcct+state, acctHeaders, nil); errAcct == nil {
+	if acctRaw, _, errAcct := doJSON(lc.client, http.MethodGet, loginAccountEndpointFor(lc.global, state), acctHeaders, nil); errAcct == nil {
 		_ = json.Unmarshal(acctRaw, &acct)
 	}
 
+	domain := strings.TrimSpace(tok.Domain)
+	if domain == "" {
+		domain = domainForGlobal(lc.global)
+	}
 	sa := &storedAuth{
 		Type:     providerName,
 		AuthType: authTypeOAuth,
@@ -1630,7 +1936,7 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 			AccessToken:  tok.AccessToken,
 			RefreshToken: tok.RefreshToken,
 			ExpiresAt:    time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix(),
-			Domain:       tok.Domain,
+			Domain:       domain,
 		},
 		Account: storedAccount{
 			UID:          acct.UID,
@@ -1866,14 +2172,14 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 		return nil, fmt.Errorf("refresh: missing refreshToken")
 	}
 	headers := func(r *http.Request) {
-		commonHeaders(r)
+		commonHeadersFor(r, isGlobal(sa))
 		r.Header.Set("X-Refresh-Token", sa.Auth.RefreshToken)
-		if sa.Account.EnterpriseID != "" {
+		if !isGlobal(sa) && sa.Account.EnterpriseID != "" {
 			r.Header.Set("X-Enterprise-Id", sa.Account.EnterpriseID)
 		}
 		r.Header.Set("X-Auth-Refresh-Source", providerName)
 	}
-	data, status, err := doJSON(httpClientForAuth(sa), http.MethodPost, endpointTokenRefresh, headers, nil)
+	data, status, err := doJSON(httpClientForAuth(sa), http.MethodPost, tokenRefreshEndpointFor(sa), headers, nil)
 	if err != nil {
 		if status >= 400 {
 			return nil, fmt.Errorf("refresh rejected (HTTP %d)", status)
@@ -1929,21 +2235,21 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	backendHeaders(httpReq, sa)
-		resp, err := httpClientForAuth(sa).Do(httpReq)
-		if err != nil {
-			return nil, fmt.Errorf("http_error: %w", err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode >= 400 {
-			payload, _ := io.ReadAll(resp.Body)
-			return nil, upstreamHTTPError(resp.StatusCode, payload, resp.Header)
-		}
-		completion, err := aggregateCompletion(resp.Body, req.Model)
-		if err != nil {
-			return nil, err
-		}
-		return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
+	resp, err := httpClientForAuth(sa).Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("http_error: %w", err)
 	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		payload, _ := io.ReadAll(resp.Body)
+		return nil, upstreamHTTPError(resp.StatusCode, payload, resp.Header)
+	}
+	completion, err := aggregateCompletion(resp.Body, req.Model)
+	if err != nil {
+		return nil, err
+	}
+	return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
+}
 
 // executorStreamRequest wraps the host's executor.execute_stream RPC: the
 // ExecutorRequest plus the async stream id the host uses to receive chunks.
@@ -1979,39 +2285,39 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	}
 
 	headers := streamHeaders()
-		sseFramed := clientNeedsSSEFrame(req.Metadata)
+	sseFramed := clientNeedsSSEFrame(req.Metadata)
 
-		// No async stream id → fall back to synchronous chunk collection.
-		if req.StreamID == "" {
-			chunks, errCollect := collectUpstreamStream(body, sa, sseFramed)
-			if errCollect != nil {
-				return nil, errCollect
-			}
-			return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
+	// No async stream id → fall back to synchronous chunk collection.
+	if req.StreamID == "" {
+		chunks, errCollect := collectUpstreamStream(body, sa, sseFramed)
+		if errCollect != nil {
+			return nil, errCollect
 		}
-
-		// Open the upstream connection *before* returning so 401/402/429 reach the
-		// host as execute_stream errors (with http_status). That lets CPA MarkResult
-		// cool down / rotate credentials. Mid-stream failures still go via emit.
-		httpReq, err := http.NewRequest(http.MethodPost, chatEndpointFor(sa), bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		backendHeaders(httpReq, sa)
-		resp, err := httpClientForAuth(sa).Do(httpReq)
-		if err != nil {
-			return nil, fmt.Errorf("http_error: %w", err)
-		}
-		if resp.StatusCode >= 400 {
-			errPayload, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			return nil, upstreamHTTPError(resp.StatusCode, errPayload, resp.Header)
-		}
-
-		// Async pump of an already-accepted upstream stream body.
-		go pumpUpstreamResponse(resp, req.StreamID, sseFramed)
-		return okEnvelope(streamResponse{Headers: headers})
+		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
 	}
+
+	// Open the upstream connection *before* returning so 401/402/429 reach the
+	// host as execute_stream errors (with http_status). That lets CPA MarkResult
+	// cool down / rotate credentials. Mid-stream failures still go via emit.
+	httpReq, err := http.NewRequest(http.MethodPost, chatEndpointFor(sa), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	backendHeaders(httpReq, sa)
+	resp, err := httpClientForAuth(sa).Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("http_error: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		errPayload, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, upstreamHTTPError(resp.StatusCode, errPayload, resp.Header)
+	}
+
+	// Async pump of an already-accepted upstream stream body.
+	go pumpUpstreamResponse(resp, req.StreamID, sseFramed)
+	return okEnvelope(streamResponse{Headers: headers})
+}
 
 func streamHeaders() http.Header {
 	h := http.Header{}
@@ -2022,119 +2328,119 @@ func streamHeaders() http.Header {
 }
 
 // pumpUpstreamResponse reads an already-open upstream SSE body in the
-	// background and emits each cleaned chunk to the host stream. It closes the
-	// stream when done. An emit failure (client disconnected → host closed the
-	// stream) aborts the pump so we stop reading a dead upstream.
-	func pumpUpstreamResponse(resp *http.Response, streamID string, sseFramed bool) {
-		if resp == nil {
-			streamEmitError(streamID, "http_error: nil upstream response")
-			streamClose(streamID)
-			return
-		}
-		defer resp.Body.Close()
-		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-		for scanner.Scan() {
-			content := stripDataPrefix(scanner.Text())
-			if content == "" || content == "[DONE]" {
-				continue
-			}
-			cleaned := cleanChunkJSON(content)
-			if cleaned == "" {
-				continue
-			}
-			if sseFramed {
-				cleaned = "data: " + cleaned
-			}
-			if err := streamEmit(streamID, []byte(cleaned)); err != nil {
-				break
-			}
-		}
+// background and emits each cleaned chunk to the host stream. It closes the
+// stream when done. An emit failure (client disconnected → host closed the
+// stream) aborts the pump so we stop reading a dead upstream.
+func pumpUpstreamResponse(resp *http.Response, streamID string, sseFramed bool) {
+	if resp == nil {
+		streamEmitError(streamID, "http_error: nil upstream response")
 		streamClose(streamID)
+		return
 	}
-
-	// collectUpstreamStream is the synchronous fallback (no async stream id): drain
-	// the upstream, clean each chunk, return them as a slice.
-	func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, error) {
-		httpReq, err := http.NewRequest(http.MethodPost, chatEndpointFor(sa), bytes.NewReader(body))
-		if err != nil {
-			return nil, err
+	defer resp.Body.Close()
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		content := stripDataPrefix(scanner.Text())
+		if content == "" || content == "[DONE]" {
+			continue
 		}
-		backendHeaders(httpReq, sa)
-		resp, err := httpClientForAuth(sa).Do(httpReq)
-		if err != nil {
-			return nil, fmt.Errorf("http_error: %w", err)
+		cleaned := cleanChunkJSON(content)
+		if cleaned == "" {
+			continue
 		}
-		defer resp.Body.Close()
-		if resp.StatusCode >= 400 {
-			errPayload, _ := io.ReadAll(resp.Body)
-			return nil, upstreamHTTPError(resp.StatusCode, errPayload, resp.Header)
+		if sseFramed {
+			cleaned = "data: " + cleaned
 		}
-		return aggregateSSE(resp.Body, sseFramed), nil
+		if err := streamEmit(streamID, []byte(cleaned)); err != nil {
+			break
+		}
 	}
+	streamClose(streamID)
+}
 
-	// upstreamHTTPError builds a StatusError the CPA host can use for auth cooldown.
-	// 429 with CodeBuddy quota-exhausted (14018 / 额度已用尽) gets a long RetryAfter
-	// so the scheduler stops hammering the same credential.
-	func upstreamHTTPError(status int, body []byte, headers http.Header) error {
-		msg := fmt.Sprintf("upstream %d: %s", status, truncate(string(body), 200))
-		err := &statusError{
-			Message:    msg,
-			Code:       "upstream_error",
-			HTTPStatus: status,
-			Retryable:  status == http.StatusTooManyRequests || status == http.StatusRequestTimeout || status >= 500,
-		}
-		if status == http.StatusTooManyRequests {
-			if ra := parseRetryAfterHeader(headers); ra != nil {
-				err.retryAfter = ra
-			} else if isQuotaExhaustedBody(body) {
-				// Permanent-ish quota until the user recharges; cool for max CPA window.
-				d := 30 * time.Minute
-				err.retryAfter = &d
-			}
-		}
-		return err
+// collectUpstreamStream is the synchronous fallback (no async stream id): drain
+// the upstream, clean each chunk, return them as a slice.
+func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, error) {
+	httpReq, err := http.NewRequest(http.MethodPost, chatEndpointFor(sa), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
 	}
+	backendHeaders(httpReq, sa)
+	resp, err := httpClientForAuth(sa).Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("http_error: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		errPayload, _ := io.ReadAll(resp.Body)
+		return nil, upstreamHTTPError(resp.StatusCode, errPayload, resp.Header)
+	}
+	return aggregateSSE(resp.Body, sseFramed), nil
+}
 
-	func parseRetryAfterHeader(headers http.Header) *time.Duration {
-		if headers == nil {
-			return nil
+// upstreamHTTPError builds a StatusError the CPA host can use for auth cooldown.
+// 429 with CodeBuddy quota-exhausted (14018 / 额度已用尽) gets a long RetryAfter
+// so the scheduler stops hammering the same credential.
+func upstreamHTTPError(status int, body []byte, headers http.Header) error {
+	msg := fmt.Sprintf("upstream %d: %s", status, truncate(string(body), 200))
+	err := &statusError{
+		Message:    msg,
+		Code:       "upstream_error",
+		HTTPStatus: status,
+		Retryable:  status == http.StatusTooManyRequests || status == http.StatusRequestTimeout || status >= 500,
+	}
+	if status == http.StatusTooManyRequests {
+		if ra := parseRetryAfterHeader(headers); ra != nil {
+			err.retryAfter = ra
+		} else if isQuotaExhaustedBody(body) {
+			// Permanent-ish quota until the user recharges; cool for max CPA window.
+			d := 30 * time.Minute
+			err.retryAfter = &d
 		}
-		raw := strings.TrimSpace(headers.Get("Retry-After"))
-		if raw == "" {
-			return nil
-		}
-		// Seconds form.
-		if secs, err := strconv.Atoi(raw); err == nil && secs > 0 {
-			d := time.Duration(secs) * time.Second
-			return &d
-		}
-		// HTTP-date form.
-		if t, err := http.ParseTime(raw); err == nil {
-			d := time.Until(t)
-			if d > 0 {
-				return &d
-			}
-		}
+	}
+	return err
+}
+
+func parseRetryAfterHeader(headers http.Header) *time.Duration {
+	if headers == nil {
 		return nil
 	}
-
-	func isQuotaExhaustedBody(body []byte) bool {
-		s := string(body)
-		if s == "" {
-			return false
-		}
-		// CodeBuddy: {"error":{"data":{"code":14018,"msg":"额度已用尽…"}}}
-		if strings.Contains(s, "14018") {
-			return true
-		}
-		if strings.Contains(s, "额度已用尽") {
-			return true
-		}
-		lower := strings.ToLower(s)
-		return strings.Contains(lower, "quota") &&
-			(strings.Contains(lower, "exhaust") || strings.Contains(lower, "exceed") || strings.Contains(lower, "insufficient"))
+	raw := strings.TrimSpace(headers.Get("Retry-After"))
+	if raw == "" {
+		return nil
 	}
+	// Seconds form.
+	if secs, err := strconv.Atoi(raw); err == nil && secs > 0 {
+		d := time.Duration(secs) * time.Second
+		return &d
+	}
+	// HTTP-date form.
+	if t, err := http.ParseTime(raw); err == nil {
+		d := time.Until(t)
+		if d > 0 {
+			return &d
+		}
+	}
+	return nil
+}
+
+func isQuotaExhaustedBody(body []byte) bool {
+	s := string(body)
+	if s == "" {
+		return false
+	}
+	// CodeBuddy: {"error":{"data":{"code":14018,"msg":"额度已用尽…"}}}
+	if strings.Contains(s, "14018") {
+		return true
+	}
+	if strings.Contains(s, "额度已用尽") {
+		return true
+	}
+	lower := strings.ToLower(s)
+	return strings.Contains(lower, "quota") &&
+		(strings.Contains(lower, "exhaust") || strings.Contains(lower, "exceed") || strings.Contains(lower, "insufficient"))
+}
 
 // clientNeedsSSEFrame reports whether chunk payloads must carry their own
 // "data: " SSE framing. CPA's chat-completions passthrough adds the prefix
@@ -2497,13 +2803,13 @@ func cleanupOrphanToolCalls(msgs []any) ([]any, bool) {
 func sanitizeBlockedTemplates(s string) string {
 	// Fast path: skip expensive replacements when no trigger is present.
 	const (
-		triggerClaude    = "You are Claude"
-		triggerMainBr    = "Main branch"
-		triggerCodex     = "You are Codex"
-		triggerFeedback  = "give feedback to Anthropic"
-		trigger11128     = "11128"
-		triggerHeader    = "x-anthropic"
-		triggerKV        = "cc_"
+		triggerClaude   = "You are Claude"
+		triggerMainBr   = "Main branch"
+		triggerCodex    = "You are Codex"
+		triggerFeedback = "give feedback to Anthropic"
+		trigger11128    = "11128"
+		triggerHeader   = "x-anthropic"
+		triggerKV       = "cc_"
 	)
 	hasAny := strings.Contains(s, triggerClaude) ||
 		strings.Contains(s, triggerMainBr) ||
@@ -2895,19 +3201,167 @@ type managementHandleResponse struct {
 	Body       []byte              `json:"Body"`
 }
 
+type hostAuthListResponse struct {
+	Files []pluginapi.HostAuthFileEntry `json:"files"`
+}
+
+func hostCallbackResult(method string, request any, target any) error {
+	rawRequest, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	raw, err := hostCallFn(method, rawRequest)
+	if err != nil {
+		return fmt.Errorf("host auth callback failed")
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return fmt.Errorf("host auth callback response invalid")
+	}
+	if !env.OK {
+		return fmt.Errorf("host auth callback rejected request")
+	}
+	if target != nil && json.Unmarshal(env.Result, target) != nil {
+		return fmt.Errorf("host auth callback result invalid")
+	}
+	return nil
+}
+
+func cachedAccountSummary(cacheKey string, sa *storedAuth, item pluginapi.HostAuthFileEntry, force bool) accountSummary {
+	accountCacheMu.Lock()
+	cached := accountCacheMap[cacheKey]
+	if !force && cached != nil {
+		ttl := accountCacheTTL
+		if cached.isError {
+			ttl = accountCacheErrTTL
+		}
+		if time.Since(cached.fetchedAt) < ttl {
+			result := cached.summary
+			accountCacheMu.Unlock()
+			return result
+		}
+	}
+	accountCacheMu.Unlock()
+
+	realm := "cn"
+	if isGlobal(sa) {
+		realm = "global"
+	}
+	summary := accountSummary{
+		ID: firstNonEmpty(item.AuthIndex, item.ID, sa.authID()), Label: firstNonEmpty(item.Label, sa.label(), item.Name),
+		Nickname: sa.Account.Nickname, UID: maskAccountIdentifier(firstNonEmpty(sa.Account.UID, sa.UserID)),
+		Realm: realm, AuthType: sa.authMode(), Disabled: item.Disabled || sa.Disabled,
+		Models: modelSummariesFor(sa), UpdatedAt: time.Now().UTC(),
+	}
+	if sa.isAPIKey() {
+		summary.Unsupported = true
+		summary.Error = "API Key 凭据暂不支持套餐与积分余额查询"
+	} else {
+		balance, cycleStart, cycleEnd, balanceErr := fetchUserResource(sa, time.Now())
+		if balanceErr != nil {
+			summary.Error = "套餐或积分余额暂时不可用"
+		} else {
+			summary.Balance, summary.CycleStart, summary.CycleEnd = balance, cycleStart, cycleEnd
+		}
+		if plan, planErr := fetchPaymentType(sa); planErr == nil {
+			summary.Plan = plan
+		}
+		if enterprise, start, end, enterpriseErr := fetchEnterpriseUsageCN(sa); enterpriseErr == nil && enterprise != nil {
+			summary.Enterprise = enterprise
+			if summary.CycleStart == "" {
+				summary.CycleStart, summary.CycleEnd = start, end
+			}
+		}
+	}
+	accountCacheMu.Lock()
+	accountCacheMap[cacheKey] = &accountCacheEntry{summary: summary, fetchedAt: time.Now(), isError: summary.Error != "" && !summary.Unsupported}
+	accountCacheMu.Unlock()
+	return summary
+}
+
+func listAccountSummaries(force bool, onlyID string) ([]accountSummary, error) {
+	var listed hostAuthListResponse
+	if err := hostCallbackResult(pluginabi.MethodHostAuthList, map[string]any{}, &listed); err != nil {
+		return nil, err
+	}
+	out := make([]accountSummary, 0)
+	for _, item := range listed.Files {
+		if item.Type != providerName && item.Provider != providerName {
+			continue
+		}
+		if onlyID != "" && onlyID != item.AuthIndex && onlyID != item.ID {
+			continue
+		}
+		var stored pluginapi.HostAuthGetResponse
+		if err := hostCallbackResult(pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: item.AuthIndex}, &stored); err != nil {
+			out = append(out, accountSummary{ID: item.AuthIndex, Label: firstNonEmpty(item.Label, item.Name, "WorkBuddy"), Disabled: item.Disabled, UpdatedAt: time.Now().UTC(), Error: "无法读取该凭据"})
+			continue
+		}
+		sa, err := parseStored(stored.JSON)
+		if err != nil {
+			out = append(out, accountSummary{ID: item.AuthIndex, Label: firstNonEmpty(item.Label, item.Name, "WorkBuddy"), Disabled: item.Disabled, UpdatedAt: time.Now().UTC(), Error: "该凭据格式无效"})
+			continue
+		}
+		out = append(out, cachedAccountSummary(firstNonEmpty(item.AuthIndex, item.ID, sa.authID()), sa, item, force))
+	}
+	return out, nil
+}
+
+func managementJSON(status int, value any) ([]byte, error) {
+	body, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	return okEnvelope(managementHandleResponse{StatusCode: status, Headers: map[string][]string{"Content-Type": {"application/json"}}, Body: body})
+}
+
+func saveOAuthPollResult(body []byte) ([]byte, error) {
+	var req pluginapi.AuthLoginPollRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		return managementJSON(http.StatusBadRequest, map[string]string{"error": "invalid login poll request"})
+	}
+	raw, err := handlePollLogin(body)
+	if err != nil {
+		return nil, err
+	}
+	var env envelope
+	var poll pluginapi.AuthLoginPollResponse
+	if json.Unmarshal(raw, &env) != nil || !env.OK || json.Unmarshal(env.Result, &poll) != nil {
+		return managementJSON(http.StatusBadGateway, map[string]string{"error": "登录状态读取失败"})
+	}
+	if poll.Status != pluginapi.AuthLoginStatusSuccess {
+		return managementJSON(http.StatusOK, map[string]any{"status": poll.Status, "message": poll.Message})
+	}
+	if len(poll.Auth.StorageJSON) == 0 {
+		return managementJSON(http.StatusBadGateway, map[string]string{"error": "登录凭据无效"})
+	}
+	name := strings.TrimSpace(poll.Auth.FileName)
+	if name == "" {
+		name = authFileName
+	}
+	if err := hostCallbackResult(pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{Name: name, JSON: poll.Auth.StorageJSON}, nil); err != nil {
+		return managementJSON(http.StatusBadGateway, map[string]string{"error": "无法保存登录凭据"})
+	}
+	return managementJSON(http.StatusOK, map[string]any{"status": "success", "message": "登录凭据已保存", "id": poll.Auth.ID, "label": poll.Auth.Label})
+}
+
 func wbManagementRegistration() managementRegResponse {
 	return managementRegResponse{
 		// Authenticated management API (needs management Bearer token).
 		Routes: []managementRouteJSON{
 			{Method: "POST", Path: "/workbuddy/api-key"},
 			{Method: "GET", Path: "/workbuddy/api-key"},
+			{Method: "GET", Path: "/workbuddy/accounts"},
+			{Method: "POST", Path: "/workbuddy/accounts/refresh"},
+			{Method: "POST", Path: "/workbuddy/oauth/start"},
+			{Method: "POST", Path: "/workbuddy/oauth/poll"},
 		},
 		// Browser menu under /v0/resource/plugins/workbuddy/...
 		Resources: []managementResourceJSON{
 			{
 				Path:        "/api-key",
-				Menu:        "WorkBuddy API Key",
-				Description: "Add a CodeBuddy API key without using the OAuth paste box.",
+				Menu:        "WorkBuddy 管理",
+				Description: "账户概览、套餐与积分余额、国内版/国际版登录、API Key 管理。",
 			},
 		},
 	}
@@ -2924,26 +3378,41 @@ func handleManagement(raw []byte) ([]byte, error) {
 	switch {
 	case method == "GET" && strings.HasSuffix(path, "/api-key") && strings.Contains(path, "/resource/plugins/"+providerName):
 		return okEnvelope(managementHTMLResponse())
+	case method == "GET" && (path == "/v0/management/workbuddy/accounts" || strings.HasSuffix(path, "/workbuddy/accounts")):
+		accounts, err := listAccountSummaries(false, "")
+		if err != nil {
+			return managementJSON(http.StatusBadGateway, map[string]string{"error": "无法读取 WorkBuddy 凭据"})
+		}
+		return managementJSON(http.StatusOK, map[string]any{"accounts": accounts, "updated_at": time.Now().UTC()})
+	case method == "POST" && (path == "/v0/management/workbuddy/accounts/refresh" || strings.HasSuffix(path, "/workbuddy/accounts/refresh")):
+		var payload struct {
+			ID string `json:"id"`
+		}
+		_ = json.Unmarshal(req.Body, &payload)
+		accounts, err := listAccountSummaries(true, strings.TrimSpace(payload.ID))
+		if err != nil {
+			return managementJSON(http.StatusBadGateway, map[string]string{"error": "账户刷新失败"})
+		}
+		return managementJSON(http.StatusOK, map[string]any{"accounts": accounts, "updated_at": time.Now().UTC()})
+	case method == "POST" && (path == "/v0/management/workbuddy/oauth/start" || strings.HasSuffix(path, "/workbuddy/oauth/start")):
+		var payload struct {
+			Realm string `json:"realm"`
+		}
+		_ = json.Unmarshal(req.Body, &payload)
+		global := strings.EqualFold(strings.TrimSpace(payload.Realm), "global")
+		started, err := startLoginForRealm(pluginapi.AuthLoginStartRequest{}, global)
+		if err != nil {
+			return managementJSON(http.StatusBadGateway, map[string]string{"error": "无法发起登录"})
+		}
+		return managementJSON(http.StatusOK, map[string]any{"state": started.State, "url": started.URL, "realm": map[bool]string{false: "cn", true: "global"}[global], "expires_at": started.ExpiresAt})
+	case method == "POST" && (path == "/v0/management/workbuddy/oauth/poll" || strings.HasSuffix(path, "/workbuddy/oauth/poll")):
+		return saveOAuthPollResult(req.Body)
 	case method == "GET" && (path == "/v0/management/workbuddy/api-key" || strings.HasSuffix(path, "/workbuddy/api-key")):
-		// Simple health / help for the API endpoint.
-		body, _ := json.Marshal(map[string]any{
-			"provider": providerName,
-			"usage":    "POST /v0/management/workbuddy/api-key with JSON {\"api_key\":\"...\"}",
-			"note":     "Do not use oauth-callback redirect_url for API keys; host requires state+code.",
-		})
-		return okEnvelope(managementHandleResponse{
-			StatusCode: 200,
-			Headers:    map[string][]string{"Content-Type": {"application/json"}},
-			Body:       body,
-		})
+		return managementJSON(http.StatusOK, map[string]any{"provider": providerName, "usage": "POST /v0/management/workbuddy/api-key with JSON {\"api_key\":\"...\"}"})
 	case method == "POST" && (path == "/v0/management/workbuddy/api-key" || strings.HasSuffix(path, "/workbuddy/api-key")):
 		return handleSaveAPIKey(req.Body)
 	default:
-		return okEnvelope(managementHandleResponse{
-			StatusCode: 404,
-			Headers:    map[string][]string{"Content-Type": {"application/json"}},
-			Body:       []byte(`{"error":"not found"}`),
-		})
+		return managementJSON(http.StatusNotFound, map[string]string{"error": "not found"})
 	}
 }
 
@@ -3014,18 +3483,11 @@ func handleSaveAPIKey(body []byte) ([]byte, error) {
 		"name": fileName,
 		"json": json.RawMessage(storage),
 	})
-	if _, err := hostCall(pluginabi.MethodHostAuthSave, saveReq); err != nil {
-		// Fall back: if host.auth.save unavailable, return the JSON for manual upload.
-		msg, _ := json.Marshal(map[string]any{
-			"error":    "host.auth.save failed: " + err.Error(),
-			"hint":     "Upload this JSON via Auth Files, or fix host callback support",
+	if _, err := hostCallFn(pluginabi.MethodHostAuthSave, saveReq); err != nil {
+		// Never return storage here: it contains the supplied API key.
+		return managementJSON(http.StatusBadGateway, map[string]any{
+			"error":    "无法保存 API Key 凭据",
 			"fileName": fileName,
-			"auth":     json.RawMessage(storage),
-		})
-		return okEnvelope(managementHandleResponse{
-			StatusCode: 502,
-			Headers:    map[string][]string{"Content-Type": {"application/json"}},
-			Body:       msg,
 		})
 	}
 	out, _ := json.Marshal(map[string]any{
@@ -3051,264 +3513,59 @@ func handleSaveAPIKey(body []byte) ([]byte, error) {
 // apiKeyPageHTML is served at /v0/resource/plugins/workbuddy/api-key
 // (management menu: "WorkBuddy API Key"). Uses same-origin fetch with the
 // management token from the parent management UI when available.
-const apiKeyPageHTML = `<!doctype html>
-	<html lang="zh-CN">
-	<head>
-	  <meta charset="utf-8" />
-	  <meta name="viewport" content="width=device-width, initial-scale=1" />
-	  <meta name="color-scheme" content="light dark" />
-	  <title>WorkBuddy API Key</title>
-	  <style>
-	    :root {
-	      color-scheme: light dark;
-	      font-family: system-ui, sans-serif;
-	      --bg: #f4f4f5;
-	      --card: #fff;
-	      --border: #e4e4e7;
-	      --text: #111;
-	      --muted: #52525b;
-	      --input-bg: #fff;
-	      --input-border: #d4d4d8;
-	      --code-bg: #f4f4f5;
-	      --btn-bg: #111;
-	      --btn-fg: #fff;
-	      --ok: #15803d;
-	      --err: #b91c1c;
-	      --shadow: 0 1px 2px rgba(0,0,0,.04);
-	    }
-	    @media (prefers-color-scheme: dark) {
-	      :root {
-	        --bg: #09090b;
-	        --card: #18181b;
-	        --border: #27272a;
-	        --text: #fafafa;
-	        --muted: #a1a1aa;
-	        --input-bg: #09090b;
-	        --input-border: #3f3f46;
-	        --code-bg: #27272a;
-	        --btn-bg: #fafafa;
-	        --btn-fg: #09090b;
-	        --ok: #4ade80;
-	        --err: #f87171;
-	        --shadow: 0 1px 2px rgba(0,0,0,.4);
-	      }
-	    }
-	    html[data-theme="dark"] {
-	      --bg: #09090b;
-	      --card: #18181b;
-	      --border: #27272a;
-	      --text: #fafafa;
-	      --muted: #a1a1aa;
-	      --input-bg: #09090b;
-	      --input-border: #3f3f46;
-	      --code-bg: #27272a;
-	      --btn-bg: #fafafa;
-	      --btn-fg: #09090b;
-	      --ok: #4ade80;
-	      --err: #f87171;
-	      --shadow: 0 1px 2px rgba(0,0,0,.4);
-	    }
-	    html[data-theme="light"] {
-	      --bg: #f4f4f5;
-	      --card: #fff;
-	      --border: #e4e4e7;
-	      --text: #111;
-	      --muted: #52525b;
-	      --input-bg: #fff;
-	      --input-border: #d4d4d8;
-	      --code-bg: #f4f4f5;
-	      --btn-bg: #111;
-	      --btn-fg: #fff;
-	      --ok: #15803d;
-	      --err: #b91c1c;
-	      --shadow: 0 1px 2px rgba(0,0,0,.04);
-	    }
-	    body { max-width: 560px; margin: 32px auto; padding: 0 16px; background: var(--bg); color: var(--text); }
-	    .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; box-shadow: var(--shadow); }
-	    h1 { font-size: 18px; margin: 0 0 8px; color: var(--text); }
-	    p, li { font-size: 13px; color: var(--muted); line-height: 1.5; }
-	    label { display: block; font-size: 12px; font-weight: 600; margin: 14px 0 6px; color: var(--muted); }
-	    input, textarea {
-	      width: 100%; box-sizing: border-box; padding: 10px;
-	      border: 1px solid var(--input-border); border-radius: 6px; font: inherit;
-	      background: var(--input-bg); color: var(--text);
-	    }
-	    input::placeholder, textarea::placeholder { color: var(--muted); opacity: .8; }
-	    textarea { min-height: 88px; font-family: ui-monospace, monospace; font-size: 12px; }
-	    button {
-	      margin-top: 14px; padding: 10px 16px; border: 0; border-radius: 6px;
-	      background: var(--btn-bg); color: var(--btn-fg); font-weight: 600; cursor: pointer;
-	    }
-	    button:disabled { opacity: .5; cursor: not-allowed; }
-	    button.secondary {
-	      margin-left: 8px; background: transparent; color: var(--text);
-	      border: 1px solid var(--input-border);
-	    }
-	    .ok { color: var(--ok); } .err { color: var(--err); }
-	    pre { background: var(--code-bg); color: var(--text); padding: 10px; border-radius: 6px; overflow: auto; font-size: 12px; border: 1px solid var(--border); }
-	    code { background: var(--code-bg); padding: 1px 4px; border-radius: 3px; color: var(--text); }
-	    .toolbar { display: flex; justify-content: flex-end; margin-bottom: 8px; }
-	  </style>
-	</head>
-<body>
-  <div class="toolbar">
-    <button type="button" class="secondary" id="themeBtn" onclick="toggleTheme()">深色/浅色</button>
-  </div>
-  <div class="card">
-    <h1>WorkBuddy · 添加 CodeBuddy API Key</h1>
-    <p>不要把 API Key 填进 OAuth「回调 URL / 授权码」框——CPA 宿主会校验 <code>state</code>，插件收不到粘贴内容。</p>
-    <p>禁用凭据、模型别名、排除模型请用 CPA 标准字段（本页可填，或面板 PATCH / auth JSON）。禁用后该凭据不再注册模型。</p>
-    <label>Management Token（与 CPA 管理面板相同）</label>
-    <input id="token" placeholder="Bearer token / management key" autocomplete="off" />
-	    <label>CodeBuddy API Key</label>
-	    <textarea id="key" placeholder="粘贴 CodeBuddy API Key"></textarea>
-	    <label>User ID（可选，默认 anonymous）</label>
-	    <input id="uid" value="anonymous" />
-	    <label>prefix（可选，模型前缀，单段无 /）</label>
-	    <input id="prefix" placeholder="例如 wb" />
-	    <label>proxy_url（可选，该凭据出站代理）</label>
-	    <input id="proxy" placeholder="http://127.0.0.1:7890" />
-	    <label>priority（可选，调度优先级，整数）</label>
-	    <input id="priority" type="number" placeholder="0" />
-	    <label>excluded_models（可选，逗号分隔，对该凭据隐藏的上游模型 id）</label>
-	    <input id="excluded" placeholder="hy3,minimax-m3-pay" />
-	    <label>model_aliases JSON（可选，CPA 模型别名）</label>
-	    <textarea id="aliases" placeholder='[{"name":"hy3-preview-agent","alias":"hy3"}]' style="min-height:64px"></textarea>
-	    <label style="display:flex;align-items:center;gap:8px;text-transform:none;font-weight:500">
-	      <input id="disabled" type="checkbox" style="width:auto" /> 创建后立即禁用（disabled）
-	    </label>
-	    <button id="btn" onclick="saveKey()">保存</button>
-	    <p id="msg"></p>
-	    <pre id="out" hidden></pre>
-	  </div>
-		  <script>
-		    (function(){
-		      const params = new URLSearchParams(location.search);
-		      const fromQuery = params.get('token') || params.get('management_key') || '';
-		      let fromParent = '';
-		      try {
-		        fromParent = localStorage.getItem('management_key')
-		          || localStorage.getItem('cpa_management_key')
-		          || localStorage.getItem('cliproxy_management_key')
-		          || '';
-		      } catch (e) {}
-		      if (fromQuery || fromParent) document.getElementById('token').value = fromQuery || fromParent;
-		      try {
-		        const saved = localStorage.getItem('wb_theme');
-		        if (saved === 'dark' || saved === 'light') document.documentElement.setAttribute('data-theme', saved);
-		      } catch (e) {}
-		    })();
-		    function toggleTheme(){
-		      const cur = document.documentElement.getAttribute('data-theme');
-		      const next = cur === 'dark' ? 'light' : (cur === 'light' ? 'dark' :
-		        (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'light' : 'dark'));
-		      document.documentElement.setAttribute('data-theme', next);
-		      try { localStorage.setItem('wb_theme', next); } catch (e) {}
-		    }
-		    async function saveKey(){
-	      const token = document.getElementById('token').value.trim();
-	      const api_key = document.getElementById('key').value.trim();
-	      const user_id = document.getElementById('uid').value.trim() || 'anonymous';
-	      const prefix = document.getElementById('prefix').value.trim();
-	      const proxy_url = document.getElementById('proxy').value.trim();
-	      const priorityRaw = document.getElementById('priority').value.trim();
-	      const excludedRaw = document.getElementById('excluded').value.trim();
-	      const aliasesRaw = document.getElementById('aliases').value.trim();
-	      const disabled = document.getElementById('disabled').checked;
-	      const msg = document.getElementById('msg');
-	      const out = document.getElementById('out');
-	      msg.textContent = ''; out.hidden = true;
-	      if (!api_key) { msg.innerHTML = '<span class="err">请填写 API Key</span>'; return; }
-	      if (!token) { msg.innerHTML = '<span class="err">请填写 Management Token</span>'; return; }
-	      const body = { api_key, user_id };
-	      if (prefix) body.prefix = prefix;
-	      if (proxy_url) body.proxy_url = proxy_url;
-	      if (priorityRaw !== '') body.priority = Number(priorityRaw);
-	      if (excludedRaw) body.excluded_models = excludedRaw.split(/[,\n]/).map(s => s.trim()).filter(Boolean);
-	      if (aliasesRaw) {
-	        try { body.model_aliases = JSON.parse(aliasesRaw); }
-	        catch (e) { msg.innerHTML = '<span class="err">model_aliases 不是合法 JSON</span>'; return; }
-	      }
-	      if (disabled) body.disabled = true;
-	      const btn = document.getElementById('btn');
-	      btn.disabled = true;
-	      try {
-	        const r = await fetch('/v0/management/workbuddy/api-key', {
-	          method: 'POST',
-	          headers: {
-	            'Authorization': 'Bearer ' + token,
-	            'Content-Type': 'application/json'
-	          },
-	          body: JSON.stringify(body)
-	        });
-	        const text = await r.text();
-	        let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
-	        out.hidden = false; out.textContent = JSON.stringify(data, null, 2);
-	        if (r.ok && data.status === 'ok') {
-	          msg.innerHTML = '<span class="ok">已保存：' + (data.fileName || data.id || '') + '</span>';
-	        } else {
-	          msg.innerHTML = '<span class="err">失败 HTTP ' + r.status + '</span>';
-	        }
-	      } catch (e) {
-	        msg.innerHTML = '<span class="err">' + e + '</span>';
-	      } finally {
-	        btn.disabled = false;
-	      }
-	    }
-	  </script>
-</body>
-</html>`
+const apiKeyPageHTML = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>WorkBuddy 管理</title><style>:root{font-family:system-ui,sans-serif;color-scheme:light dark;--bg:#f4f4f5;--card:#fff;--border:#ddd;--text:#111;--muted:#555;--btn:#111;--btnfg:#fff}@media(prefers-color-scheme:dark){:root{--bg:#09090b;--card:#18181b;--border:#333;--text:#fafafa;--muted:#aaa;--btn:#fafafa;--btnfg:#09090b}}html[data-theme=dark]{--bg:#09090b;--card:#18181b;--border:#333;--text:#fafafa;--muted:#aaa;--btn:#fafafa;--btnfg:#09090b}html[data-theme=light]{--bg:#f4f4f5;--card:#fff;--border:#ddd;--text:#111;--muted:#555;--btn:#111;--btnfg:#fff}body{max-width:1000px;margin:28px auto;padding:0 16px;background:var(--bg);color:var(--text)}.card{background:var(--card);border:1px solid var(--border);padding:16px;border-radius:10px;margin:12px 0}.row,.tabs,.summary{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.tabs{margin:16px 0}button{padding:9px 12px;border:0;border-radius:6px;background:var(--btn);color:var(--btnfg);font-weight:600;cursor:pointer}.secondary{background:transparent;color:var(--text);border:1px solid var(--border)}.active{outline:2px solid var(--text)}input,textarea,select{box-sizing:border-box;width:100%;padding:9px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text)}label{display:block;margin:10px 0 4px;color:var(--muted);font-size:13px}.metric{min-width:120px;border:1px solid var(--border);border-radius:7px;padding:8px}.metric small{color:var(--muted)}.metric strong{display:block;margin-top:4px}.badge{font-size:12px;border:1px solid var(--border);border-radius:99px;padding:2px 6px;margin:2px}.models{width:100%;border-collapse:collapse;margin-top:12px;font-size:12px}.models th,.models td{border-top:1px solid var(--border);padding:7px;text-align:left}.err{color:#c22}.ok{color:#187a35}.muted,p{color:var(--muted);font-size:13px}textarea{min-height:72px;font-family:ui-monospace,monospace}.panel[hidden]{display:none}</style></head><body><div class="row"><div><h1>WorkBuddy 管理</h1><p>套餐和积分余额仅由插件后端用 OAuth 凭据查询；网页不会获得 API Key 或 Token。</p></div><button class="secondary" onclick="theme()">深色/浅色</button></div><div class="card"><label>Management Token（与 CPA 管理面板相同）</label><div class="row"><input id="token" placeholder="Bearer token / management key" style="max-width:500px"><button class="secondary" onclick="load(false)">加载账户</button><button class="secondary" onclick="load(true)">刷新全部</button><span id="message"></span></div></div><div class="tabs"><button class="tab active" data-id="overview" onclick="tab('overview')">账户概览</button><button class="tab" data-id="login" onclick="tab('login')">OAuth 登录</button><button class="tab" data-id="key" onclick="tab('key')">添加 API Key</button></div><section class="panel" id="overview"><div class="summary" id="summary"></div><div id="accounts"><p>填写 Management Token 后加载账户。</p></div></section><section class="panel" id="login" hidden><div class="card"><h2>OAuth 登录</h2><p>请选择账号所属区域，完成浏览器授权后本页会自动保存凭据。</p><button onclick="login('cn')">登录国内版（CodeBuddy）</button><button class="secondary" onclick="login('global')">登录国际版（WorkBuddy）</button><p id="loginMsg"></p></div></section><section class="panel" id="key" hidden><div class="card"><h2>添加 API Key</h2><p>API Key 可用于模型调用；上游未确认它支持套餐/积分余额接口，因此概览会明确标记为不支持。</p><label>CodeBuddy API Key</label><textarea id="keyValue" placeholder="粘贴 API Key"></textarea><label>区域</label><select id="domain"><option value="copilot.tencent.com">国内版</option><option value="www.workbuddy.ai">国际版</option></select><label>User ID（可选，默认 anonymous）</label><input id="uid" value="anonymous"><label>prefix（可选）</label><input id="prefix"><label>proxy_url（可选）</label><input id="proxy" placeholder="http://127.0.0.1:7890"><label>priority（可选）</label><input id="priority" type="number" placeholder="0"><label>excluded_models（可选，逗号分隔）</label><input id="excluded"><label>model_aliases JSON（可选）</label><textarea id="aliases" placeholder='[{"name":"hy3-preview-agent","alias":"hy3"}]'></textarea><label><input id="disabled" type="checkbox" style="width:auto"> 创建后立即禁用</label><button id="save" onclick="save()">保存 API Key</button><span id="keyMsg"></span></div></section><script>const base='/v0/management/workbuddy/';let timer;(()=>{const q=new URLSearchParams(location.search);let v=q.get('token')||q.get('management_key')||'';try{v=v||localStorage.getItem('management_key')||localStorage.getItem('cpa_management_key')||'';const t=localStorage.getItem('wb_theme');if(t)document.documentElement.dataset.theme=t}catch(e){}token.value=v})();function theme(){let t=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=t;try{localStorage.setItem('wb_theme',t)}catch(e){}}function tab(id){document.querySelectorAll('.panel').forEach(x=>x.hidden=x.id!==id);document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.id===id));if(id==='overview')load(false)}function msg(id,s,bad){const x=document.getElementById(id);x.textContent=s;x.className=bad?'err':'ok'}async function call(path,method='GET',body){if(!token.value.trim())throw Error('请填写 Management Token');const r=await fetch(base+path,{method,headers:{Authorization:'Bearer '+token.value.trim(),'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const d=await r.json();if(!r.ok)throw Error(d.error||'HTTP '+r.status);return d}function add(p,t,v){let x=document.createElement('div');x.className='metric';x.innerHTML='<small></small><strong></strong>';x.children[0].textContent=t;x.children[1].textContent=v;p.append(x)}function value(v){return v===undefined||v===null||v===''?'—':String(v)}function credits(v){return v?value(v.remaining)+' / '+value(v.total)+' '+value(v.unit):'暂未提供'}function render(items){summary.replaceChildren();accounts.replaceChildren();let cn=0,gl=0,on=0;items.forEach(a=>{a.realm==='global'?gl++:cn++;if(!a.disabled)on++});[['凭据',items.length],['可用',on],['国内版',cn],['国际版',gl]].forEach(x=>add(summary,x[0],x[1]));if(!items.length){accounts.textContent='尚未保存 WorkBuddy 凭据。';return}items.forEach(a=>{let c=document.createElement('article');c.className='card';let h=document.createElement('h2');h.textContent=value(a.label);c.append(h);let b=document.createElement('div');b.className='row';[a.realm,a.auth_type,a.disabled?'已禁用':'已启用'].forEach(x=>{let z=document.createElement('span');z.className='badge';z.textContent=value(x);b.append(z)});c.append(b);let g=document.createElement('div');g.className='summary';[['账号',value(a.nickname)||value(a.uid)],['套餐',value(a.plan)],['积分余额',credits(a.balance)],['企业额度',credits(a.enterprise)],['周期',a.cycle_start||a.cycle_end?value(a.cycle_start)+' ~ '+value(a.cycle_end):'—']].forEach(x=>add(g,x[0],x[1]));c.append(g);if(a.error){let p=document.createElement('p');p.textContent=a.error;p.className=a.unsupported?'muted':'err';c.append(p)}if(a.models&&a.models.length){let t=document.createElement('table');t.className='models';t.innerHTML='<thead><tr><th>模型</th><th>倍率</th><th>上下文</th><th>最大输出</th><th>能力</th></tr></thead>';let body=document.createElement('tbody');a.models.forEach(m=>{let tr=document.createElement('tr');[m.name||m.id,m.credits||'—',m.context||'—',m.max_output||'—',[m.images?'图片':'',m.reasoning?'推理':'',m.tool_call?'工具':''].filter(Boolean).join(' / ')||'—'].forEach(v=>{let td=document.createElement('td');td.textContent=String(v);tr.append(td)});body.append(tr)});t.append(body);c.append(t)}let r=document.createElement('button');r.className='secondary';r.textContent='刷新此账户';r.onclick=()=>load(true,a.id);c.append(r);accounts.append(c)})}async function load(force,id=''){try{msg('message','加载中…');let d=await call(force?'accounts/refresh':'accounts',force?'POST':'GET',force?{id}:null);render(d.accounts||[]);msg('message','已更新')}catch(e){msg('message',e.message,true)}}async function login(realm){try{msg('loginMsg','正在创建登录会话…');let d=await call('oauth/start','POST',{realm});let win=open(d.url,'workbuddy-login');if(!win)msg('loginMsg','请允许浏览器打开登录窗口。',true);else msg('loginMsg','已打开登录窗口，正在等待授权…');clearInterval(timer);timer=setInterval(()=>poll(d.state),2500)}catch(e){msg('loginMsg',e.message,true)}}async function poll(state){try{let d=await call('oauth/poll','POST',{state});if(d.status==='success'){clearInterval(timer);msg('loginMsg','登录成功，凭据已保存。');tab('overview');load(true)}else if(d.status==='error'){clearInterval(timer);msg('loginMsg',d.message||'登录失败',true)}}catch(e){clearInterval(timer);msg('loginMsg',e.message,true)}}async function save(){let key=keyValue.value.trim();if(!key){msg('keyMsg','请填写 API Key',true);return}let button=document.getElementById('save');try{let aliases=document.getElementById('aliases').value.trim(),priorityInput=document.getElementById('priority'),excludedInput=document.getElementById('excluded');let body={api_key:key,user_id:uid.value.trim()||'anonymous',domain:domain.value,prefix:prefix.value.trim(),proxy_url:proxy.value.trim(),disabled:document.getElementById('disabled').checked};if(priorityInput.value.trim())body.priority=Number(priorityInput.value);if(excludedInput.value.trim())body.excluded_models=excludedInput.value.split(/[ ,
+]/).map(x=>x.trim()).filter(Boolean);if(aliases)body.model_aliases=JSON.parse(aliases);button.disabled=true;let d=await call('api-key','POST',body);keyValue.value='';msg('keyMsg','已保存：'+(d.fileName||d.id||''));load(true)}catch(e){msg('keyMsg',e.message,true)}finally{button.disabled=false}}</script></body></html>`
 
 // -----------------------------------------------------------------------------
 // envelope helpers
 // -----------------------------------------------------------------------------
 
 func okEnvelope(v any) ([]byte, error) {
-		result, err := json.Marshal(v)
-		if err != nil {
-			return nil, err
-		}
-		return json.Marshal(envelope{OK: true, Result: result})
+	result, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
 	}
+	return json.Marshal(envelope{OK: true, Result: result})
+}
 
-	func errorEnvelope(code, message string, httpStatus int) []byte {
-		err := &envelopeError{Code: code, Message: message, HTTPStatus: httpStatus}
-		if httpStatus == http.StatusTooManyRequests || httpStatus == http.StatusRequestTimeout || httpStatus >= 500 {
-			err.Retryable = true
-		}
-		raw, _ := json.Marshal(envelope{OK: false, Error: err})
-		return raw
+func errorEnvelope(code, message string, httpStatus int) []byte {
+	err := &envelopeError{Code: code, Message: message, HTTPStatus: httpStatus}
+	if httpStatus == http.StatusTooManyRequests || httpStatus == http.StatusRequestTimeout || httpStatus >= 500 {
+		err.Retryable = true
 	}
+	raw, _ := json.Marshal(envelope{OK: false, Error: err})
+	return raw
+}
 
-	func errorEnvelopeFromErr(err error) []byte {
-		if err == nil {
-			return errorEnvelope("plugin_error", "plugin call failed", 0)
-		}
-		// Prefer typed statusError (and any StatusCode() implementer).
-		type statusCoder interface {
-			StatusCode() int
-		}
-		code := "plugin_error"
-		status := 0
-		retryable := false
-		message := err.Error()
-		if se, ok := err.(*statusError); ok && se != nil {
-			if se.Code != "" {
-				code = se.Code
-			}
-			status = se.HTTPStatus
-			retryable = se.Retryable
-			message = se.Message
-		} else if sc, ok := err.(statusCoder); ok && sc != nil {
-			status = sc.StatusCode()
-		}
-		envErr := &envelopeError{Code: code, Message: message, HTTPStatus: status, Retryable: retryable}
-		if !envErr.Retryable && (status == http.StatusTooManyRequests || status == http.StatusRequestTimeout || status >= 500) {
-			envErr.Retryable = true
-		}
-		raw, _ := json.Marshal(envelope{OK: false, Error: envErr})
-		return raw
+func errorEnvelopeFromErr(err error) []byte {
+	if err == nil {
+		return errorEnvelope("plugin_error", "plugin call failed", 0)
 	}
+	// Prefer typed statusError (and any StatusCode() implementer).
+	type statusCoder interface {
+		StatusCode() int
+	}
+	code := "plugin_error"
+	status := 0
+	retryable := false
+	message := err.Error()
+	if se, ok := err.(*statusError); ok && se != nil {
+		if se.Code != "" {
+			code = se.Code
+		}
+		status = se.HTTPStatus
+		retryable = se.Retryable
+		message = se.Message
+	} else if sc, ok := err.(statusCoder); ok && sc != nil {
+		status = sc.StatusCode()
+	}
+	envErr := &envelopeError{Code: code, Message: message, HTTPStatus: status, Retryable: retryable}
+	if !envErr.Retryable && (status == http.StatusTooManyRequests || status == http.StatusRequestTimeout || status >= 500) {
+		envErr.Retryable = true
+	}
+	raw, _ := json.Marshal(envelope{OK: false, Error: envErr})
+	return raw
+}
 
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 	if response == nil || len(raw) == 0 {
