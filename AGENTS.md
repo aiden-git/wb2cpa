@@ -36,7 +36,16 @@ go vet ./...
 go test ./...
 ```
 
-Release: push tag `v0.3.3` → Actions publishes store-compatible zips + `checksums.txt`.
+Release (⚠️ this repo is a **fork** — tag pushes do NOT trigger workflows, so
+dispatch against the tag ref after pushing it):
+
+```bash
+git tag -a v0.3.4 -m "workbuddy v0.3.4" && git push origin v0.3.4
+gh workflow run Build --ref v0.3.4     # required on forks
+```
+
+Release notes: `.github/release-notes.md` (or `.github/release-notes-<tag>.md`)
+is used verbatim when present; `${GITHUB_REF_NAME}` expands to the tag.
 
 Keep CPA pin aligned with host (**v7.2.x**). Smoke: load plugin, `plugin_id=workbuddy`, `GET /v1/models`.
 

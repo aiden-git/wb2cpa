@@ -312,10 +312,34 @@ CPA 宿主本身支持 401/402/429 后冷却并换下一张 workbuddy 凭据，�
 
 ## 发布 / 插件商店
 
-1. 推送 tag：`git tag v0.3.3 && git push origin v0.3.3`
-2. GitHub Actions（`.github/workflows/build.yml`）构建多平台 zip + `checksums.txt` 并创建 Release
-3. （可选）向 [CLIProxyAPI-Plugins-Store](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store) 提 PR，追加 `docs/plugin-store-entry.json` 到其 `registry.json`——自用可跳过，直接用自己的 `store-sources` 即可
-4. 之后只需打新 tag 发版，商店会读 latest release，无需每次改 registry
+1. 更新版本号（`Makefile`、`main.go` 的 `pluginVersion`、`registry.json`、`docs/plugin-store-entry.json`），提交
+2. 推送 tag：
+
+```bash
+git tag -a v0.3.4 -m "workbuddy v0.3.4" && git push origin v0.3.4
+```
+
+3. 触发构建（**fork 仓库必须这一步**）：
+
+```bash
+gh workflow run Build --ref v0.3.4
+```
+
+4. GitHub Actions（`.github/workflows/build.yml`）构建 6 个平台 zip + `checksums.txt` 并创建 Release
+5. （可选）向 [CLIProxyAPI-Plugins-Store](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store) 提 PR，追加 `docs/plugin-store-entry.json` 到其 `registry.json`——自用可跳过，直接用自己的 `store-sources` 即可
+6. 之后只需打新 tag 发版，商店会读 latest release，无需每次改 registry
+
+### ⚠️ fork 仓库的 tag 不会自动触发构建
+
+GitHub 对 **fork** 仓库默认不运行 `push` 触发的 workflow。只推 tag 会**静默失败**——没有构建、没有 release，商店安装时报找不到资产。
+
+解决办法就是上面第 3 步：用 `gh workflow run Build --ref <tag>` 在 tag ref 上手动派发。这样 `GITHUB_REF_TYPE=tag`，版本号能正确解析，release job 的 `startsWith(github.ref, 'refs/tags/v')` 判断也会通过。
+
+想根治的话，把仓库脱离 fork 状态（GitHub 设置里 detach fork，或另建一个非 fork 仓库），之后 tag push 即可自动触发。
+
+### Release notes 自定义
+
+把说明写到 `.github/release-notes.md`（或针对某版本用 `.github/release-notes-<tag>.md`），构建时会原样采用；文件里可用 `${GITHUB_REF_NAME}` 占位符，发布时替换为 tag 名。两者都不存在时用 workflow 内置的默认说明。
 
 规范摘要：
 
