@@ -20,8 +20,7 @@ Module: `github.com/WslzGmzs/workbuddy-cli-proxy` · Plugin ID: **`workbuddy`** 
 | `.github/scripts/package-release.go` | Zip library at root + sha256 line |
 | `examples/workbuddy-api-key.json` | Manual API-key credential template |
 | `registry.json` | CPA plugin-store registry (schema_version 1, github-release) |
-| `docs/plugin-store-entry.json` | Same plugin object for official store PR |
-| `README.md` | Install, credentials, store publishing |
+| `README.md` | Install, credentials, usage (personal use; local build is primary) |
 
 Build artifacts (`*.so` / `*.dylib` / `*.dll` / `*.h` / `dist/` / `workbuddy_*.zip`) and credential files are gitignored — never commit tokens or API keys.
 
@@ -163,10 +162,9 @@ API key management page (`/v0/resource/plugins/workbuddy/api-key`) supports ligh
 - Inject version with `-X main.pluginVersion=...` on release builds.
 - Keep `wbModels()` in sync with the actual upstream model set — it is the fallback when dynamic fetch fails.
 - Plugin store `repository` field must be exact `https://github.com/WslzGmzs/workbuddy-cli-proxy` (no trailing slash, no `.git`).
-- Root `registry.json` is the private `store-sources` entry point; version field is display fallback only — real version comes from GitHub latest release tag `v*`.
+- Root `registry.json` is the `store-sources` entry point; version field is display fallback only — real version comes from GitHub latest release tag `v*`.
 
 ## Docs to read first
 
-- `README.md` — install, credentials, realm setup, store PR flow
-- `docs/plugin-store-entry.json` — registry entry
+- `README.md` — install (local build), credentials, realm setup, usage
 - Comments on `rewriteModelForUpstream`, `upstreamHTTPError`, `rewriteSystemForUpstream`, `sanitizeBlockedTemplates`, `repackToolResultBlocks`, `cleanupOrphanToolCalls`, `forceMaxThinking`, `fetchDynamicModels`, `nonChatModel`, `isGlobalDomain`, `chatEndpointFor`, `handleExecStream`, `clientNeedsSSEFrame`, `parseStored` / `backendHeaders`
