@@ -88,17 +88,33 @@ const (
 	authFileName   = "workbuddy.json"
 	authTypeOAuth  = "oauth"
 	authTypeAPIKey = "api_key"
-	upstreamBase   = "https://copilot.tencent.com"
-	clientUA       = "CLI/2.63.2 CodeBuddy/2.63.2"
-	originReferer  = "https://www.codebuddy.cn"
 
+	// CN realm (default)
+	upstreamBase  = "https://copilot.tencent.com"
+	clientUA      = "CLI/2.63.2 CodeBuddy/2.63.2"
+	cnOrigin      = "https://www.codebuddy.cn"
+	originReferer = cnOrigin // backward-compat alias
+
+	// Global realm (www.workbuddy.ai accounts)
+	globalBase   = "https://www.workbuddy.ai"
+	globalOrigin = "https://www.workbuddy.ai"
+
+	// CN auth endpoints (login/refresh always hit CN regardless of realm)
 	endpointAuthState    = upstreamBase + "/v2/plugin/auth/state?platform=CLI"
 	endpointLoginAcct    = upstreamBase + "/v2/plugin/login/account?state="
 	endpointAuthToken    = upstreamBase + "/v2/plugin/auth/token?state="
 	endpointTokenRefresh = upstreamBase + "/v2/plugin/auth/token/refresh"
-	endpointChat         = upstreamBase + "/v2/chat/completions"
 
-	loginTTL = 5 * time.Minute
+	// Chat endpoint (realm-dependent; use chatEndpointFor(sa) at call sites)
+	endpointChat = upstreamBase + "/v2/chat/completions"
+
+	// Model-list paths (appended to the per-realm base URL)
+	cnModelsPath     = "/console/enterprises/personal/models"
+	globalModelsPath = "/v2/enterprises/personal/models"
+
+	loginTTL        = 5 * time.Minute
+	modelCacheTTL   = 60 * time.Minute
+	modelCacheErrTTL = 5 * time.Minute
 )
 
 // loginCtx holds the cookie-affined HTTP client for one in-flight login flow.
@@ -114,7 +130,18 @@ var (
 	loginStates    sync.Map             // state(string) -> *loginCtx
 	httpClientOnce sync.Once
 	sharedClient   *http.Client
+
+	// Per-realm dynamic model cache (keyed by "cn" or "global").
+	modelCacheMu    sync.Mutex
+	modelCacheMap   = map[string]*modelCacheEntry{}
 )
+
+// modelCacheEntry holds a cached model list with a TTL.
+type modelCacheEntry struct {
+	models    []pluginapi.ModelInfo
+	fetchedAt time.Time
+	isError   bool // true → cached failure; use shorter TTL
+}
 
 func main() {}
 
@@ -400,6 +427,184 @@ func wbModels() []pluginapi.ModelInfo {
 		})
 	}
 	return models
+}
+
+// -----------------------------------------------------------------------------
+// Dynamic model discovery
+// -----------------------------------------------------------------------------
+
+// dynModelEntry matches the upstream model object returned by both CN and
+// Global model-list endpoints. Unknown fields are ignored.
+type dynModelEntry struct {
+	ID                string   `json:"id"`
+	Name              string   `json:"name"`
+	MaxInputTokens    int64    `json:"maxInputTokens"`
+	MaxOutputTokens   int64    `json:"maxOutputTokens"`
+	Disabled          bool     `json:"disabled"`
+	SupportsImages    bool     `json:"supportsImages"`
+	SupportsReasoning bool     `json:"supportsReasoning"`
+	SupportsToolCall  bool     `json:"supportsToolCall"`
+	Tags              []string `json:"tags"`
+	// Credits is a string (e.g. "1.0") in the upstream response.
+	Credits   string `json:"credits"`
+	Reasoning struct {
+		DefaultEffort    string   `json:"defaultEffort"`
+		SupportedEfforts []string `json:"supportedEfforts"`
+	} `json:"reasoning"`
+}
+
+// nonChatModel returns true for models that are not suitable for chat
+// completions and should be excluded from the CPA model list.
+func nonChatModel(e dynModelEntry) bool {
+	// Prefixes that signal non-chat capabilities.
+	for _, pfx := range []string{"nes-", "completion-", "codewise-"} {
+		if strings.HasPrefix(e.ID, pfx) {
+			return true
+		}
+	}
+	// Tiny maxOutputTokens (1–256) indicates an embedding/classifier slot.
+	if e.MaxOutputTokens > 0 && e.MaxOutputTokens <= 256 {
+		return true
+	}
+	// Explicit image-generation tag.
+	for _, t := range e.Tags {
+		if t == "text-to-image" {
+			return true
+		}
+	}
+	return false
+}
+
+// fetchDynamicModels calls the upstream model-list endpoint, filters by the
+// CLI agent allowlist and nonChatModel, and converts to pluginapi.ModelInfo.
+// On any error the caller falls back to wbModels().
+func fetchDynamicModels(sa *storedAuth) ([]pluginapi.ModelInfo, error) {
+	cacheKey := "cn"
+	if isGlobal(sa) {
+		cacheKey = "global"
+	}
+
+	// Check cache first.
+	modelCacheMu.Lock()
+	entry, exists := modelCacheMap[cacheKey]
+	if exists {
+		ttl := modelCacheTTL
+		if entry.isError {
+			ttl = modelCacheErrTTL
+		}
+		if time.Since(entry.fetchedAt) < ttl {
+			cached := entry.models
+			modelCacheMu.Unlock()
+			if entry.isError {
+				return nil, fmt.Errorf("model fetch cached failure")
+			}
+			return cached, nil
+		}
+	}
+	modelCacheMu.Unlock()
+
+	// Fetch from upstream.
+	url := modelsEndpointFor(sa)
+	httpReq, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	backendHeaders(httpReq, sa)
+	resp, err := httpClientForAuth(sa).Do(httpReq)
+	if err != nil {
+		storeModelCacheError(cacheKey)
+		return nil, fmt.Errorf("models fetch: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		storeModelCacheError(cacheKey)
+		return nil, fmt.Errorf("models fetch: HTTP %d", resp.StatusCode)
+	}
+
+	// Parse {code, data:{models, agents:[{name:"cli", models:[...]}]}}
+	var envelope struct {
+		Code int `json:"code"`
+		Data struct {
+			Models []dynModelEntry `json:"models"`
+			Agents []struct {
+				Name   string   `json:"name"`
+				Models []string `json:"models"`
+			} `json:"agents"`
+		} `json:"data"`
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		storeModelCacheError(cacheKey)
+		return nil, fmt.Errorf("models fetch: parse error: %w", err)
+	}
+
+	// Build CLI agent allowlist.
+	cliAllowlist := map[string]struct{}{}
+	for _, ag := range envelope.Data.Agents {
+		if ag.Name == "cli" {
+			for _, mid := range ag.Models {
+				cliAllowlist[mid] = struct{}{}
+			}
+			break
+		}
+	}
+	hasCLIList := len(cliAllowlist) > 0
+
+	// Convert to ModelInfo, filtering by allowlist + nonChatModel.
+	var result []pluginapi.ModelInfo
+	for _, e := range envelope.Data.Models {
+		if e.Disabled {
+			continue
+		}
+		if hasCLIList {
+			if _, inList := cliAllowlist[e.ID]; !inList {
+				continue
+			}
+		}
+		if nonChatModel(e) {
+			continue
+		}
+		ctx := e.MaxInputTokens
+		if ctx == 0 {
+			ctx = 131072
+		}
+		maxOut := e.MaxOutputTokens
+		if maxOut == 0 {
+			maxOut = 8192
+		}
+		name := e.Name
+		if name == "" {
+			name = e.ID
+		}
+		result = append(result, pluginapi.ModelInfo{
+			ID:                         e.ID,
+			Object:                     "model",
+			OwnedBy:                    providerName,
+			DisplayName:                name,
+			Name:                       e.ID,
+			SupportedGenerationMethods: []string{"chat"},
+			ContextLength:              ctx,
+			MaxCompletionTokens:        maxOut,
+			UserDefined:                true,
+		})
+	}
+
+	// Cache success.
+	modelCacheMu.Lock()
+	modelCacheMap[cacheKey] = &modelCacheEntry{
+		models:    result,
+		fetchedAt: time.Now(),
+		isError:   false,
+	}
+	modelCacheMu.Unlock()
+
+	return result, nil
+}
+
+func storeModelCacheError(key string) {
+	modelCacheMu.Lock()
+	modelCacheMap[key] = &modelCacheEntry{fetchedAt: time.Now(), isError: true}
+	modelCacheMu.Unlock()
 }
 
 // -----------------------------------------------------------------------------
@@ -975,19 +1180,63 @@ func newLoginClient() *http.Client {
 }
 
 func commonHeaders(req *http.Request) {
+	commonHeadersFor(req, false)
+}
+
+// commonHeadersFor sets request headers. isGlobal selects the workbuddy.ai origin.
+func commonHeadersFor(req *http.Request, isGlb bool) {
+	origin := cnOrigin
+	if isGlb {
+		origin = globalOrigin
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Origin", originReferer)
-	req.Header.Set("Referer", originReferer+"/")
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", origin+"/")
 	req.Header.Set("User-Agent", clientUA)
+}
+
+// isGlobalDomain returns true for workbuddy.ai accounts (global realm).
+// The domain field in storedAuth is the bare host (no scheme, no path).
+func isGlobalDomain(domain string) bool {
+	return domain == "www.workbuddy.ai" ||
+		strings.HasSuffix(domain, ".workbuddy.ai")
+}
+
+// isGlobal is a convenience wrapper over isGlobalDomain for a storedAuth.
+func isGlobal(sa *storedAuth) bool {
+	d := sa.Auth.Domain
+	if d == "" {
+		d = sa.Domain
+	}
+	return isGlobalDomain(d)
+}
+
+// chatEndpointFor returns the chat completions URL for the credential's realm.
+func chatEndpointFor(sa *storedAuth) string {
+	if isGlobal(sa) {
+		return globalBase + "/v2/chat/completions"
+	}
+	return endpointChat
+}
+
+// modelsEndpointFor returns the model-list URL for the credential's realm.
+func modelsEndpointFor(sa *storedAuth) string {
+	if isGlobal(sa) {
+		return globalBase + globalModelsPath
+	}
+	return upstreamBase + cnModelsPath
 }
 
 // backendHeaders applies auth-derived headers to a chat completion request.
 // Empty fields are signalled via the X-No-* convention used by CodeBuddy.
 // API-key mode sends both Authorization Bearer and X-API-Key (CodeBuddy accepts either).
+// X-Refresh-Token is intentionally NOT sent here; it belongs only in handleRefreshAuth.
 func backendHeaders(req *http.Request, sa *storedAuth) {
-	commonHeaders(req)
+	glb := isGlobal(sa)
+	commonHeadersFor(req, glb)
+
 	if sa.isAPIKey() {
 		key := sa.resolvedAPIKey()
 		if key != "" {
@@ -1012,29 +1261,31 @@ func backendHeaders(req *http.Request, sa *storedAuth) {
 		req.Header.Set("X-No-User-Id", "1")
 	}
 
-	enterpriseID := sa.Account.EnterpriseID
-	if enterpriseID == "" {
-		enterpriseID = sa.EnterpriseID
-	}
-	if enterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", enterpriseID)
-		req.Header.Set("X-Tenant-Id", enterpriseID)
-	} else {
+	if glb {
+		// Global accounts are personal — no enterprise concept.
 		req.Header.Set("X-No-Enterprise-Id", "1")
-	}
-
-	if !sa.isAPIKey() && sa.Auth.RefreshToken != "" {
-		req.Header.Set("X-Refresh-Token", sa.Auth.RefreshToken)
-	}
-
-	domain := sa.Auth.Domain
-	if domain == "" {
-		domain = sa.Domain
-	}
-	if domain != "" {
-		req.Header.Set("X-Domain", domain)
+		req.Header.Set("X-Domain", "www.workbuddy.ai")
 	} else {
-		req.Header.Set("X-No-Department-Info", "1")
+		enterpriseID := sa.Account.EnterpriseID
+		if enterpriseID == "" {
+			enterpriseID = sa.EnterpriseID
+		}
+		if enterpriseID != "" {
+			req.Header.Set("X-Enterprise-Id", enterpriseID)
+			req.Header.Set("X-Tenant-Id", enterpriseID)
+		} else {
+			req.Header.Set("X-No-Enterprise-Id", "1")
+		}
+
+		domain := sa.Auth.Domain
+		if domain == "" {
+			domain = sa.Domain
+		}
+		if domain != "" {
+			req.Header.Set("X-Domain", domain)
+		} else {
+			req.Header.Set("X-No-Department-Info", "1")
+		}
 	}
 
 	req.Header.Set("X-Product", "SaaS")
@@ -1249,7 +1500,12 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 	if sa.Disabled {
 		return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: nil})
 	}
-	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: wbModels()})
+	// Prefer dynamic model list from upstream; fall back to static list on error.
+	models, err := fetchDynamicModels(sa)
+	if err != nil || len(models) == 0 {
+		models = wbModels()
+	}
+	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
 }
 
 func handleStartLogin(raw []byte) ([]byte, error) {
@@ -1668,7 +1924,7 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	if err := ensureModelAllowed(body, sa); err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+	httpReq, err := http.NewRequest(http.MethodPost, chatEndpointFor(sa), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -1737,7 +1993,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		// Open the upstream connection *before* returning so 401/402/429 reach the
 		// host as execute_stream errors (with http_status). That lets CPA MarkResult
 		// cool down / rotate credentials. Mid-stream failures still go via emit.
-		httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+		httpReq, err := http.NewRequest(http.MethodPost, chatEndpointFor(sa), bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
@@ -1800,7 +2056,7 @@ func streamHeaders() http.Header {
 	// collectUpstreamStream is the synchronous fallback (no async stream id): drain
 	// the upstream, clean each chunk, return them as a slice.
 	func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, error) {
-		httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+		httpReq, err := http.NewRequest(http.MethodPost, chatEndpointFor(sa), bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
@@ -2001,15 +2257,42 @@ func rewriteSystemForUpstream(payload []byte) []byte {
 	}
 	messages, _ := obj["messages"].([]any)
 	changed := false
+
+	// Normalize role "developer" → "system" (some clients send the Anthropic variant).
 	for _, m := range messages {
 		msg, ok := m.(map[string]any)
 		if !ok {
 			continue
 		}
+		if role, _ := msg["role"].(string); role == "developer" {
+			msg["role"] = "system"
+			changed = true
+		}
 		if rewriteContentField(msg) {
 			changed = true
 		}
 	}
+
+	// Tool-call pairing cleanup: repack scattered results then prune orphans.
+	if msgs2, repacked := repackToolResultBlocks(messages); repacked {
+		obj["messages"] = msgs2
+		messages = msgs2
+		changed = true
+	}
+	if msgs3, pruned := cleanupOrphanToolCalls(messages); pruned {
+		obj["messages"] = msgs3
+		changed = true
+	}
+
+	// Translate max_completion_tokens → max_tokens when max_tokens is absent.
+	if mct, ok := obj["max_completion_tokens"]; ok {
+		if _, hasMaxTokens := obj["max_tokens"]; !hasMaxTokens {
+			obj["max_tokens"] = mct
+		}
+		delete(obj, "max_completion_tokens")
+		changed = true
+	}
+
 	if forceMaxThinking(obj) {
 		changed = true
 	}
@@ -2052,13 +2335,242 @@ func rewriteContentField(msg map[string]any) bool {
 	return false
 }
 
+// repackToolResultBlocks moves non-tool-result messages that appear inside a
+// contiguous tool-result block to just after that block. Some clients emit:
+//
+//	[assistant(tool_calls), tool, tool, user("ok"), tool]
+//
+// CodeBuddy requires all tool results to directly follow their assistant call,
+// so the stray "user" must be relocated. Returns the reordered slice and true
+// if any change was made.
+func repackToolResultBlocks(msgs []any) ([]any, bool) {
+	if len(msgs) == 0 {
+		return msgs, false
+	}
+	changed := false
+	result := make([]any, 0, len(msgs))
+	i := 0
+	for i < len(msgs) {
+		msg, ok := msgs[i].(map[string]any)
+		if !ok {
+			result = append(result, msgs[i])
+			i++
+			continue
+		}
+		role, _ := msg["role"].(string)
+		// Start of a tool-result block: assistant with tool_calls.
+		if role == "assistant" {
+			if tc, hasTc := msg["tool_calls"]; hasTc && tc != nil {
+				result = append(result, msgs[i])
+				i++
+				// Collect the contiguous tool-result messages; park non-tool ones.
+				var toolResults []any
+				var interleaved []any
+				for i < len(msgs) {
+					next, ok2 := msgs[i].(map[string]any)
+					if !ok2 {
+						interleaved = append(interleaved, msgs[i])
+						i++
+						continue
+					}
+					nr, _ := next["role"].(string)
+					if nr == "tool" {
+						toolResults = append(toolResults, msgs[i])
+						i++
+					} else {
+						// Not a tool result → end of this block.
+						break
+					}
+				}
+				// Append: tool results first, then anything we parked.
+				result = append(result, toolResults...)
+				if len(interleaved) > 0 {
+					result = append(result, interleaved...)
+					changed = true
+				}
+				continue
+			}
+		}
+		result = append(result, msgs[i])
+		i++
+	}
+	return result, changed
+}
+
+// cleanupOrphanToolCalls removes tool_call/tool_result pairs that have no
+// matching counterpart. An assistant message whose entire tool_calls array
+// would become empty has tool_calls removed; a tool message with no matching
+// call is dropped entirely.
+func cleanupOrphanToolCalls(msgs []any) ([]any, bool) {
+	if len(msgs) == 0 {
+		return msgs, false
+	}
+	// Collect call IDs emitted by assistant messages.
+	callIDs := map[string]struct{}{}
+	for _, m := range msgs {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := msg["role"].(string); role != "assistant" {
+			continue
+		}
+		tcs, _ := msg["tool_calls"].([]any)
+		for _, tc := range tcs {
+			tcm, ok2 := tc.(map[string]any)
+			if !ok2 {
+				continue
+			}
+			if id, _ := tcm["id"].(string); id != "" {
+				callIDs[id] = struct{}{}
+			}
+		}
+	}
+	// Collect result IDs from tool messages.
+	resultIDs := map[string]struct{}{}
+	for _, m := range msgs {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := msg["role"].(string); role != "tool" {
+			continue
+		}
+		if id, _ := msg["tool_call_id"].(string); id != "" {
+			resultIDs[id] = struct{}{}
+		}
+	}
+	changed := false
+	out := make([]any, 0, len(msgs))
+	for _, m := range msgs {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			out = append(out, m)
+			continue
+		}
+		role, _ := msg["role"].(string)
+		switch role {
+		case "tool":
+			// Drop if its call was never emitted.
+			id, _ := msg["tool_call_id"].(string)
+			if _, found := callIDs[id]; !found {
+				changed = true
+				continue
+			}
+			out = append(out, m)
+		case "assistant":
+			tcs, _ := msg["tool_calls"].([]any)
+			if len(tcs) == 0 {
+				out = append(out, m)
+				continue
+			}
+			kept := make([]any, 0, len(tcs))
+			for _, tc := range tcs {
+				tcm, ok2 := tc.(map[string]any)
+				if !ok2 {
+					kept = append(kept, tc)
+					continue
+				}
+				id, _ := tcm["id"].(string)
+				if _, hasResult := resultIDs[id]; hasResult || id == "" {
+					kept = append(kept, tc)
+				} else {
+					changed = true
+				}
+			}
+			if len(kept) == 0 {
+				delete(msg, "tool_calls")
+			} else {
+				msg["tool_calls"] = kept
+			}
+			out = append(out, m)
+		default:
+			out = append(out, m)
+		}
+	}
+	return out, changed
+}
+
+// sanitizeBlockedTemplates rewrites strings that would cause CodeBuddy to
+// reject the request or exhibit undesired behaviour. It also neutralises
+// the literal "11128" probe string that triggers an upstream blocklist.
 func sanitizeBlockedTemplates(s string) string {
+	// Fast path: skip expensive replacements when no trigger is present.
+	const (
+		triggerClaude    = "You are Claude"
+		triggerMainBr    = "Main branch"
+		triggerCodex     = "You are Codex"
+		triggerFeedback  = "give feedback to Anthropic"
+		trigger11128     = "11128"
+		triggerHeader    = "x-anthropic"
+		triggerKV        = "cc_"
+	)
+	hasAny := strings.Contains(s, triggerClaude) ||
+		strings.Contains(s, triggerMainBr) ||
+		strings.Contains(s, triggerCodex) ||
+		strings.Contains(s, triggerFeedback) ||
+		strings.Contains(s, trigger11128) ||
+		strings.Contains(s, triggerHeader) ||
+		strings.Contains(s, triggerKV)
+	if !hasAny {
+		return s
+	}
+
+	// Rule 1: Claude Code identity → generic CLI tool label.
 	s = strings.ReplaceAll(s,
 		"You are Claude Code, Anthropic's official CLI for Claude.",
 		"You are Claude Code, Anthropic's official CLI tool for Claude.")
+	// Rule 1b: Codex CLI identity (same pattern, different product name).
+	s = strings.ReplaceAll(s,
+		"You are Codex, Anthropic's official CLI for Claude.",
+		"You are Codex, Anthropic's official CLI tool for Claude.")
+
+	// Rule 2: "Main branch" VCS hint → "Default branch".
 	s = strings.ReplaceAll(s,
 		"Main branch (you will usually use this for PRs)",
 		"Default branch (you will usually use this for PRs)")
+
+	// Rule 3: Anthropic feedback sentence — drop it.
+	s = strings.ReplaceAll(s,
+		"Use the feedback tool to give feedback to Anthropic.",
+		"")
+
+	// Rule 4: Anti-probe — "11128" → "11-128" everywhere.
+	s = strings.ReplaceAll(s, "11128", "11-128")
+
+	// Rule 5: Strip "x-anthropic-billing-header:value" segments
+	// (colon-separated header:value pairs that begin with x-anthropic).
+	// Also strip bare "x-anthropic-billing-header" keys.
+	for strings.Contains(s, "x-anthropic") {
+		start := strings.Index(s, "x-anthropic")
+		end := start + len("x-anthropic")
+		// Advance to end of the key name (up to : or whitespace or \n).
+		for end < len(s) && s[end] != ':' && s[end] != ' ' && s[end] != '\n' && s[end] != '"' {
+			end++
+		}
+		// If followed by ':value', consume the value too (up to whitespace or comma or newline).
+		if end < len(s) && s[end] == ':' {
+			end++ // skip ':'
+			for end < len(s) && s[end] != ' ' && s[end] != '\n' && s[end] != ',' {
+				end++
+			}
+		}
+		s = s[:start] + s[end:]
+	}
+
+	// Rule 6: Strip "cc_xxx=...;" key-value pairs (CodeBuddy tracking).
+	for strings.Contains(s, "cc_") {
+		idx := strings.Index(s, "cc_")
+		end := idx + 3
+		for end < len(s) && s[end] != ';' && s[end] != ' ' && s[end] != '\n' {
+			end++
+		}
+		if end < len(s) && s[end] == ';' {
+			end++ // consume the semicolon
+		}
+		s = s[:idx] + s[end:]
+	}
+
 	return s
 }
 
