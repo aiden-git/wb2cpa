@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Clean-room Go rewrite of the **workbuddy** [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (CPA) plugin: wraps Tencent **CodeBuddy** (`copilot.tencent.com`) as an OpenAI-compatible provider for CPA. Original workbuddy design credited to Sliverkiss (`cpa-plugin`).
+Clean-room Go rewrite of the **workbuddy** [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (CPA) plugin: wraps Tencent **CodeBuddy** (`copilot.tencent.com`) and **WorkBuddy Global** (`www.workbuddy.ai`) as an OpenAI-compatible provider for CPA. Original workbuddy design credited to Sliverkiss (`cpa-plugin`).
 
 Module: `github.com/WslzGmzs/workbuddy-cli-proxy` · Plugin ID: **`workbuddy`** · Go **1.26+** · depends on `CLIProxyAPI/v7` (plugin ABI/API only).
 
@@ -11,6 +11,9 @@ Module: `github.com/WslzGmzs/workbuddy-cli-proxy` · Plugin ID: **`workbuddy`** 
 | Path | Role |
 |------|------|
 | `main.go` | Entire plugin: C ABI, auth (oauth + api_key), models, execute/stream, rewrites |
+| `features_test.go` | Tests for sanitize, tool-call cleanup, realm helpers, model filters |
+| `model_rewrite_test.go` | Tests for model id rewrite / alias / prefix / thinking logic |
+| `upstream_error_test.go` | Tests for statusError, quota exhaustion, RetryAfter |
 | `go.mod` / `go.sum` | Module + CPA SDK pin |
 | `Makefile` | Local `build` / `package` (store-compatible zip) |
 | `.github/workflows/build.yml` | Multi-arch CGO build + GitHub Release |
@@ -28,11 +31,12 @@ Requires **CGO** + C toolchain; GOOS/GOARCH must match the CPA host.
 
 ```bash
 make build                          # dist/workbuddy.<ext>
-make package VERSION=0.2.0 GOOS=linux GOARCH=amd64
+make package VERSION=0.3.0 GOOS=linux GOARCH=amd64
 go vet ./...
+go test ./...
 ```
 
-Release: push tag `v0.2.0` → Actions publishes store-compatible zips + `checksums.txt`.
+Release: push tag `v0.3.0` → Actions publishes store-compatible zips + `checksums.txt`.
 
 Keep CPA pin aligned with host (**v7.2.x**). Smoke: load plugin, `plugin_id=workbuddy`, `GET /v1/models`.
 
@@ -42,7 +46,7 @@ Provider id: `workbuddy`. C exports: `cliproxy_plugin_init`, `cliproxyPluginCall
 
 `handleMethod` → pluginabi methods:
 
-- **Register / models**: `wbRegistration` (version from `pluginVersion` ldflag), `wbModels`
+- **Register / models**: `wbRegistration` (version from `pluginVersion` ldflag), `wbModels` (static fallback)
 - **Auth**:
   - OAuth: `handleStartLogin` / `handlePollLogin` / `handleRefreshAuth` (state + cookie jar)
   - **Panel paste API key**: during login, CPA writes `.oauth-workbuddy-<state>.oauth`; poll reads it via `tryConsumePastedCredential` / `classifyPastedCredential` (URL vs raw key)
@@ -50,7 +54,56 @@ Provider id: `workbuddy`. C exports: `cliproxy_plugin_init`, `cliproxyPluginCall
 - **Execute**: force upstream stream, then `aggregateCompletion` (code **11101**)
 - **Execute stream**: async `host.stream.emit` / `close` when `stream_id` present
 
-Upstream: `https://copilot.tencent.com` · chat `/v2/chat/completions`.
+### Realm routing
+
+`isGlobalDomain(domain)` matches `www.workbuddy.ai` or `*.workbuddy.ai` → global realm.
+
+| Helper | Returns |
+|--------|---------|
+| `isGlobal(sa)` | bool; wraps `isGlobalDomain` on `sa.Auth.Domain` / `sa.Domain` |
+| `chatEndpointFor(sa)` | global: `https://www.workbuddy.ai/v2/chat/completions`; CN: `endpointChat` |
+| `modelsEndpointFor(sa)` | global: `/v2/enterprises/personal/models`; CN: `/console/enterprises/personal/models` |
+
+`commonHeadersFor(req, isGlb)` switches `Origin` / `Referer` between `cnOrigin` and `globalOrigin`.
+
+`backendHeaders` branches on realm:
+- Global: `X-No-Enterprise-Id: 1` + `X-Domain: www.workbuddy.ai` (no enterprise concept)
+- CN: existing enterprise-id / domain logic
+
+All chat-request call sites use `chatEndpointFor(sa)` — never the bare `endpointChat` constant.
+
+### Dynamic model discovery
+
+`fetchDynamicModels(sa)` → GET `modelsEndpointFor(sa)` → parse `{code, data:{models, agents}}` → filter CLI allowlist + `nonChatModel` → cache per realm.
+
+Cache: `modelCacheMu` + `modelCacheMap` keyed by `"cn"` / `"global"`.  TTLs: 1 h success, 5 min failure.
+
+`nonChatModel(e)` rejects: `nes-` / `completion-` / `codewise-` prefix; `maxOutputTokens` 1–256; `text-to-image` tag.
+
+`handleModelsForAuth` calls `fetchDynamicModels` with cache fallback to `wbModels()` on error or empty.
+
+### Request rewriting (`rewriteSystemForUpstream`)
+
+Called on every execute / stream payload before upstream send, in order:
+
+1. `developer` role → `system`
+2. `rewriteContentField` on each message — calls `sanitizeBlockedTemplates`
+3. `repackToolResultBlocks` — move non-tool elements out of tool-result runs
+4. `cleanupOrphanToolCalls` — symmetric prune of unpaired tool_call / tool messages
+5. `max_completion_tokens` → `max_tokens` (skip if `max_tokens` already set)
+6. `forceMaxThinking` — pin `reasoning_effort=high` for hy3-family models
+
+`sanitizeBlockedTemplates` has a fast gate (`hasAny` pre-check) and six rules:
+
+| Rule | Trigger | Action |
+|------|---------|--------|
+| 1a | `You are Claude Code, Anthropic's official CLI for Claude.` | `CLI` → `CLI tool` |
+| 1b | `You are Codex, Anthropic's official CLI for Claude.` | same |
+| 2 | `Main branch (you will usually use this for PRs)` | `Main branch` → `Default branch` |
+| 3 | `Use the feedback tool to give feedback to Anthropic.` | delete |
+| 4 | `11128` anywhere | → `11-128` |
+| 5 | `x-anthropic-*:value` segment | delete segment |
+| 6 | `cc_xxx=...;` KV pair | delete pair |
 
 ### Auth file shapes
 
@@ -60,10 +113,16 @@ OAuth (legacy login result):
 {"type":"workbuddy","auth":{"accessToken":"...","refreshToken":"...","expiresAt":0,"domain":"..."},"account":{"uid":"...","enterpriseId":"...","nickname":"..."},"prefix":"","proxy_url":"","priority":0}
 ```
 
-API key:
+API key (CN):
 
 ```json
 {"type":"workbuddy","auth_type":"api_key","api_key":"...","user_id":"anonymous","domain":"copilot.tencent.com","prefix":"wb","proxy_url":"http://127.0.0.1:7890","priority":100}
+```
+
+API key (Global):
+
+```json
+{"type":"workbuddy","auth_type":"api_key","api_key":"...","user_id":"anonymous","domain":"www.workbuddy.ai","prefix":"wb","priority":100}
 ```
 
 CPA standard root fields (must round-trip via `toAuthData`):
@@ -80,9 +139,10 @@ Models are **auth-bound only** (`ExecutorModelScopeOAuth`): `model.static` is em
 Refresh merges host `Metadata`/`Attributes` when storage omitted the fields (`applyHostCredentialFields`).
 
 API key management page (`/v0/resource/plugins/workbuddy/api-key`) supports light/dark (`prefers-color-scheme` + manual toggle).
-## Gotchas (do not “simplify” away)
 
-1. **Claude Code blocklist** — `sanitizeBlockedTemplates` (`CLI`→`CLI tool`, `Main branch`→`Default branch`).
+## Gotchas (do not "simplify" away)
+
+1. **Claude Code blocklist** — `sanitizeBlockedTemplates` (6 rules, fast-gate); `rewriteSystemForUpstream` normalises `developer`→`system` and translates `max_completion_tokens`→`max_tokens`.
 2. **hy3 thinking** — bare / hy3-family model → force `reasoning_effort=high`.
 3. **Model id for upstream** — CPA resolves prefix/alias into `ExecutorRequest.Model` but does **not** rewrite payload `model` when formats already match chat-completions. Always run `rewriteModelForUpstream` before send (strip `prefix/` / `WorkBuddy/`, reverse `model_aliases`), else CodeBuddy returns `11102 model … service info not found`.
 4. **Streaming** — true streaming via host emit; emit failure stops pump. For async stream, open upstream **before** returning so 4xx/429 become execute_stream errors (not mid-stream emit).
@@ -92,18 +152,21 @@ API key management page (`/v0/resource/plugins/workbuddy/api-key`) supports ligh
 8. **Chunk cleanup** — `cleanChunkJSON` drops empty delta fields.
 9. **Credentials** — never log/commit `workbuddy.json` or API keys.
 10. **Store packaging** — zip must contain **only** `workbuddy.<ext>` at root; asset name `workbuddy_<ver>_<goos>_<goarch>.zip`.
-11. **API key vs OAuth** — do not send refresh headers for api_key mode; do not require `accessToken` when `api_key` is set.
+11. **API key vs OAuth** — do not send refresh headers for api_key mode (`X-Refresh-Token` belongs only in `handleRefreshAuth`, not `backendHeaders`); do not require `accessToken` when `api_key` is set.
+12. **Realm routing** — always derive the upstream URL via `chatEndpointFor(sa)` / `modelsEndpointFor(sa)`; never hardcode `endpointChat` at call sites. Auth endpoints (login/refresh) always hit the CN base regardless of realm.
+13. **Dynamic model cache** — `modelCacheMu` guards `modelCacheMap`; lock only for read/write of the map, not for the HTTP fetch itself. On fetch failure store an error entry (5 min TTL) to avoid hammering upstream on every request.
+14. **Tool-call pairing** — `repackToolResultBlocks` runs before `cleanupOrphanToolCalls`; order matters (repack first so orphan detection sees clean blocks).
 
 ## Conventions
 
 - Prefer helpers in `main.go` unless size forces a split.
 - Inject version with `-X main.pluginVersion=...` on release builds.
-- Keep model ids stable; context lengths in `wbModels`.
+- Keep `wbModels()` in sync with the actual upstream model set — it is the fallback when dynamic fetch fails.
 - Plugin store `repository` field must be exact `https://github.com/WslzGmzs/workbuddy-cli-proxy` (no trailing slash, no `.git`).
 - Root `registry.json` is the private `store-sources` entry point; version field is display fallback only — real version comes from GitHub latest release tag `v*`.
 
 ## Docs to read first
 
-- `README.md` — install, credentials, store PR flow
+- `README.md` — install, credentials, realm setup, store PR flow
 - `docs/plugin-store-entry.json` — registry entry
-- Comments on `rewriteModelForUpstream`, `upstreamHTTPError`, `rewriteSystemForUpstream`, `forceMaxThinking`, `handleExecStream`, `clientNeedsSSEFrame`, `parseStored` / `backendHeaders`
+- Comments on `rewriteModelForUpstream`, `upstreamHTTPError`, `rewriteSystemForUpstream`, `sanitizeBlockedTemplates`, `repackToolResultBlocks`, `cleanupOrphanToolCalls`, `forceMaxThinking`, `fetchDynamicModels`, `nonChatModel`, `isGlobalDomain`, `chatEndpointFor`, `handleExecStream`, `clientNeedsSSEFrame`, `parseStored` / `backendHeaders`

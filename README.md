@@ -1,6 +1,6 @@
 # workbuddy-cli-proxy
 
-把**腾讯 CodeBuddy**（`copilot.tencent.com`）封装成 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)（CPA）插件。任何支持 OpenAI / Anthropic 协议的客户端（Claude Code、Cursor、Cline、SDK……）都能直接调用 CodeBuddy 背后的模型。
+把**腾讯 CodeBuddy**（`copilot.tencent.com`）和 **WorkBuddy 国际版**（`www.workbuddy.ai`）封装成 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)（CPA）插件。任何支持 OpenAI / Anthropic 协议的客户端（Claude Code、Cursor、Cline、SDK……）都能直接调用 CodeBuddy 背后的模型。
 
 对 [Sliverkiss/cpa-plugin](https://github.com/Sliverkiss/cpa-plugin) 公开 `workbuddy.so` 的 clean-room 逆向重写，补齐了源码与多架构构建；workbuddy 的原始设计归属 Sliverkiss。
 
@@ -12,13 +12,31 @@
 
 - **OAuth / 扫码登录** + token 刷新
 - **手动 API Key** 凭据（上传 JSON 即可）
-- 请求转发到 `copilot.tencent.com/v2/chat/completions`
+- 请求转发到上游 `/v2/chat/completions`（CN / 国际版自动路由）
+- 模型列表从上游**动态拉取**（1 小时缓存），失败时降级到内置静态列表
+
+## Realm（CN / 国际版）
+
+插件根据凭据的 `domain` 字段自动判断接入点：
+
+| domain | Realm | 聊天端点 |
+|--------|-------|---------|
+| `copilot.tencent.com`（默认） | CN | `https://copilot.tencent.com/v2/chat/completions` |
+| `www.workbuddy.ai` / `*.workbuddy.ai` | 全局 | `https://www.workbuddy.ai/v2/chat/completions` |
+
+OAuth 登录后 `domain` 由服务端下发；API Key 模式在凭据 JSON 里手动填写。
 
 ## 模型
 
-`glm-5.2` · `glm-5.1` · `glm-5v-turbo` · `kimi-k2.7` · `minimax-m3-pay` · `hy3` · `hy3-preview` · `hy3-preview-agent` · `deepseek-v4-pro` · `deepseek-v4-flash`
+模型列表**从上游动态拉取**，每张凭据独立缓存（成功 1 小时 / 失败 5 分钟）。上游返回的模型会经过以下过滤后呈现给 CPA：
 
-具体可用性以 CodeBuddy 账号权限为准。
+- 仅保留 CLI Agent 白名单内的模型
+- 过滤掉 embedding / 代码补全 / 图像生成类模型（`nes-` / `completion-` / `codewise-` 前缀；`maxOutputTokens ≤ 256`；`text-to-image` 标签）
+- 忽略上游标记 `disabled` 的模型
+
+若动态拉取失败或返回空，降级到内置列表（含 `glm-5.2`、`hy3`、`deepseek-v4-pro` 等常用模型）。
+
+具体可用性以 CodeBuddy / WorkBuddy 账号权限为准。
 
 ## 安装
 
@@ -34,7 +52,7 @@
 - `checksums.txt`（sha256sum 格式）
 
 ```bash
-git tag v0.2.0 && git push origin v0.2.0
+git tag v0.3.0 && git push origin v0.3.0
 ```
 
 没有 Release 资产时，商店能看到插件，但安装会失败。
@@ -87,14 +105,14 @@ make build
 # → dist/workbuddy.so | .dylib | .dll
 
 # 指定平台并打成商店兼容 zip
-make package VERSION=0.2.0 GOOS=linux GOARCH=amd64
+make package VERSION=0.3.0 GOOS=linux GOARCH=amd64
 ```
 
 也可手写：
 
 ```bash
 CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-  go build -buildmode=c-shared -ldflags "-s -w -X main.pluginVersion=0.2.0" \
+  go build -buildmode=c-shared -ldflags "-s -w -X main.pluginVersion=0.3.0" \
   -o workbuddy.so .
 ```
 
@@ -133,7 +151,7 @@ curl -X POST 'https://<cpa-host>/v0/management/workbuddy/api-key' \
 
 ### 3. 上传 auth JSON 文件
 
-把 CodeBuddy 控制台的 API Key 写成 JSON，作为 CPA auth 文件上传 / 放入 auth 目录：
+#### CN 账号（默认）
 
 ```json
 {
@@ -148,11 +166,23 @@ curl -X POST 'https://<cpa-host>/v0/management/workbuddy/api-key' \
 }
 ```
 
+#### 国际版账号（www.workbuddy.ai）
+
+```json
+{
+  "type": "workbuddy",
+  "auth_type": "api_key",
+  "api_key": "YOUR_WORKBUDDY_API_KEY",
+  "user_id": "anonymous",
+  "domain": "www.workbuddy.ai",
+  "prefix": "wb",
+  "priority": 100
+}
+```
+
 示例文件：[`examples/workbuddy-api-key.json`](examples/workbuddy-api-key.json)。
 
 也支持简写字段 `apiKey`。API Key 模式不会走 token refresh；请求头会带 `Authorization: Bearer <key>` 与 `X-API-Key`。
-
-可选字段：`enterprise_id` / `endpoint`（当前仍默认上游 `copilot.tencent.com`）。
 
 ### CPA 标准凭据字段
 
@@ -171,13 +201,13 @@ OAuth 扫码结果默认不带这些；可在 CPA 面板 PATCH 凭据，或直�
 
 #### 为何「禁用了还能拉模型」？
 
-旧版 workbuddy 用 **`model.static` + ExecutorModelScopeBoth`**，模型挂在 **插件静态表** 上，不跟单条凭据走。CPA 禁用凭据时只 `UnregisterClient(auth.ID)`，**静态插件模型仍在**。
+旧版 workbuddy 用 **`model.static` + `ExecutorModelScopeBoth`**，模型挂在 **插件静态表** 上，不跟单条凭据走。CPA 禁用凭据时只 `UnregisterClient(auth.ID)`，**静态插件模型仍在**。
 
 现已改为：
 
 - `ExecutorModelScope = oauth`（仅凭据绑定模型）
 - `model.static` 返回空列表
-- `model.for_auth` 在凭据 `disabled` 时返回空；有活跃凭据时返回模型列表
+- `model.for_auth` 在凭据 `disabled` 时返回空；有活跃凭据时动态拉取（或静态兜底）
 
 因此：**所有 workbuddy 凭据都禁用 / 无凭据 → `/v1/models` 不应再出现 workbuddy 模型**；至少一条启用凭据 → 正常列出。
 
@@ -241,12 +271,26 @@ curl http://localhost:8317/v1/chat/completions \
 
 ## Claude Code 兼容性
 
-腾讯 CodeBuddy 的内容审核把 Claude Code 的两句固定 system 模板逐字加进了黑名单，命中即回「敏感内容」拒答：
+腾讯 CodeBuddy 对若干固定字符串做精确黑名单，命中即回「敏感内容」拒答。插件在转发前通过 `sanitizeBlockedTemplates` 自动做最小改写：
 
-- `You are Claude Code, Anthropic's official CLI for Claude.`（身份句）
-- `Main branch (you will usually use this for PRs)`（git 注入句）
+| 触发串 | 改写方式 |
+|--------|---------|
+| `You are Claude Code, Anthropic's official CLI for Claude.` | `CLI` → `CLI tool` |
+| `You are Codex, Anthropic's official CLI for Claude.` | 同上 |
+| `Main branch (you will usually use this for PRs)` | `Main branch` → `Default branch` |
+| `Use the feedback tool to give feedback to Anthropic.` | 整句删除 |
+| 任意 `11128` | → `11-128`（反探测） |
+| `x-anthropic-billing-header:value` 段 | 整段删除 |
+| `cc_xxx=...;` KV 对 | 整对删除 |
 
-任何一字改动都绕过（精确匹配）。workbuddy 转发前会自动做最小改写（`CLI`→`CLI tool`、`Main branch`→`Default branch`）。若上游再加封禁句，改 `sanitizeBlockedTemplates`。
+函数带快速路径（先检查触发词是否存在），无触发词时不做任何字符串操作。若上游再追加黑名单，修改 `sanitizeBlockedTemplates` 即可。
+
+此外，`rewriteSystemForUpstream` 还做以下标准化：
+
+- `role: "developer"` → `"system"`（Anthropic 客户端有时发送此 role，CodeBuddy 不认）
+- `max_completion_tokens` → `max_tokens`（OpenAI 新字段，CodeBuddy 只认旧字段；若同时存在 `max_tokens` 则保留原值）
+- `repackToolResultBlocks`：将穿插在 tool-result 块中的非 tool 消息移至块尾
+- `cleanupOrphanToolCalls`：对称剪枝孤立的 tool_call / tool 消息
 
 ## 思考模式
 
@@ -268,7 +312,7 @@ CPA 宿主本身支持 401/402/429 后冷却并换下一张 workbuddy 凭据，�
 
 ## 发布 / 插件商店
 
-1. 推送 tag：`git tag v0.2.0 && git push origin v0.2.0`
+1. 推送 tag：`git tag v0.3.0 && git push origin v0.3.0`
 2. GitHub Actions（`.github/workflows/build.yml`）构建多平台 zip + `checksums.txt` 并创建 Release
 3. 向 [CLIProxyAPI-Plugins-Store](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store) 提 PR，仅追加 `docs/plugin-store-entry.json` 中的条目到 `registry.json`（`repository` 必须是 `https://github.com/WslzGmzs/workbuddy-cli-proxy`）
 4. 之后只需打新 tag 发版，商店会读 latest release，无需每次改 registry
@@ -278,7 +322,7 @@ CPA 宿主本身支持 401/402/429 后冷却并换下一张 workbuddy 凭据，�
 | 项 | 要求 |
 |----|------|
 | 插件 ID | `workbuddy`（与文件名 / zip 内库名一致） |
-| Release tag | `v<version>`，如 `v0.2.0` |
+| Release tag | `v<version>`，如 `v0.3.0` |
 | 资产名 | `workbuddy_<version>_<goos>_<goarch>.zip` |
 | zip 内容 | 根目录仅 `workbuddy.so` / `.dylib` / `.dll` |
 | 校验 | `checksums.txt`（sha256sum 格式） |
