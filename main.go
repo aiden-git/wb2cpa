@@ -80,8 +80,8 @@ import (
 
 // pluginVersion is injected at link time for release builds:
 //
-//	-ldflags "-X main.pluginVersion=0.3.0"
-var pluginVersion = "0.3.0"
+//	-ldflags "-X main.pluginVersion=0.3.3"
+var pluginVersion = "0.3.3"
 
 const (
 	providerName   = "workbuddy"

@@ -52,7 +52,7 @@ OAuth 登录后 `domain` 由服务端下发；API Key 模式在凭据 JSON 里�
 - `checksums.txt`（sha256sum 格式）
 
 ```bash
-git tag v0.3.0 && git push origin v0.3.0
+git tag v0.3.3 && git push origin v0.3.3
 ```
 
 没有 Release 资产时，商店能看到插件，但安装会失败。
@@ -105,14 +105,14 @@ make build
 # → dist/workbuddy.so | .dylib | .dll
 
 # 指定平台并打成商店兼容 zip
-make package VERSION=0.3.0 GOOS=linux GOARCH=amd64
+make package VERSION=0.3.3 GOOS=linux GOARCH=amd64
 ```
 
 也可手写：
 
 ```bash
 CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-  go build -buildmode=c-shared -ldflags "-s -w -X main.pluginVersion=0.3.0" \
+  go build -buildmode=c-shared -ldflags "-s -w -X main.pluginVersion=0.3.3" \
   -o workbuddy.so .
 ```
 
@@ -312,7 +312,7 @@ CPA 宿主本身支持 401/402/429 后冷却并换下一张 workbuddy 凭据，�
 
 ## 发布 / 插件商店
 
-1. 推送 tag：`git tag v0.3.0 && git push origin v0.3.0`
+1. 推送 tag：`git tag v0.3.3 && git push origin v0.3.3`
 2. GitHub Actions（`.github/workflows/build.yml`）构建多平台 zip + `checksums.txt` 并创建 Release
 3. （可选）向 [CLIProxyAPI-Plugins-Store](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store) 提 PR，追加 `docs/plugin-store-entry.json` 到其 `registry.json`——自用可跳过，直接用自己的 `store-sources` 即可
 4. 之后只需打新 tag 发版，商店会读 latest release，无需每次改 registry
@@ -322,7 +322,7 @@ CPA 宿主本身支持 401/402/429 后冷却并换下一张 workbuddy 凭据，�
 | 项 | 要求 |
 |----|------|
 | 插件 ID | `workbuddy`（与文件名 / zip 内库名一致） |
-| Release tag | `v<version>`，如 `v0.3.0` |
+| Release tag | `v<version>`，如 `v0.3.3` |
 | 资产名 | `workbuddy_<version>_<goos>_<goarch>.zip` |
 | zip 内容 | 根目录仅 `workbuddy.so` / `.dylib` / `.dll` |
 | 校验 | `checksums.txt`（sha256sum 格式） |

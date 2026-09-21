@@ -31,12 +31,12 @@ Requires **CGO** + C toolchain; GOOS/GOARCH must match the CPA host.
 
 ```bash
 make build                          # dist/workbuddy.<ext>
-make package VERSION=0.3.0 GOOS=linux GOARCH=amd64
+make package VERSION=0.3.3 GOOS=linux GOARCH=amd64
 go vet ./...
 go test ./...
 ```
 
-Release: push tag `v0.3.0` → Actions publishes store-compatible zips + `checksums.txt`.
+Release: push tag `v0.3.3` → Actions publishes store-compatible zips + `checksums.txt`.
 
 Keep CPA pin aligned with host (**v7.2.x**). Smoke: load plugin, `plugin_id=workbuddy`, `GET /v1/models`.
 
