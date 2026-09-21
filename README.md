@@ -67,7 +67,7 @@ plugins:
   dir: "plugins"
   # 额外商店源：指向 raw registry.json（GitHub / 自建 HTTP 均可）
   store-sources:
-    - "https://raw.githubusercontent.com/WslzGmzs/workbuddy-cli-proxy/main/registry.json"
+    - "https://raw.githubusercontent.com/aiden-git/workbuddy-cli-proxy/main/registry.json"
   configs:
     workbuddy: { enabled: true, priority: 100 }
 ```
@@ -97,7 +97,7 @@ POST /v0/management/plugin-store/workbuddy/install
 **前置**：CLIProxyAPI v7.2.x（带 CGO / 插件支持）、Go 1.26+、gcc；架构与 CPA 一致。
 
 ```bash
-git clone https://github.com/WslzGmzs/workbuddy-cli-proxy.git
+git clone https://github.com/aiden-git/workbuddy-cli-proxy.git
 cd workbuddy-cli-proxy
 
 # 当前平台
@@ -314,7 +314,7 @@ CPA 宿主本身支持 401/402/429 后冷却并换下一张 workbuddy 凭据，�
 
 1. 推送 tag：`git tag v0.3.0 && git push origin v0.3.0`
 2. GitHub Actions（`.github/workflows/build.yml`）构建多平台 zip + `checksums.txt` 并创建 Release
-3. 向 [CLIProxyAPI-Plugins-Store](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store) 提 PR，仅追加 `docs/plugin-store-entry.json` 中的条目到 `registry.json`（`repository` 必须是 `https://github.com/WslzGmzs/workbuddy-cli-proxy`）
+3. （可选）向 [CLIProxyAPI-Plugins-Store](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store) 提 PR，追加 `docs/plugin-store-entry.json` 到其 `registry.json`——自用可跳过，直接用自己的 `store-sources` 即可
 4. 之后只需打新 tag 发版，商店会读 latest release，无需每次改 registry
 
 规范摘要：

@@ -162,7 +162,7 @@ API key management page (`/v0/resource/plugins/workbuddy/api-key`) supports ligh
 - Prefer helpers in `main.go` unless size forces a split.
 - Inject version with `-X main.pluginVersion=...` on release builds.
 - Keep `wbModels()` in sync with the actual upstream model set — it is the fallback when dynamic fetch fails.
-- Plugin store `repository` field must be exact `https://github.com/WslzGmzs/workbuddy-cli-proxy` (no trailing slash, no `.git`).
+- Plugin store `repository` field must be exact `https://github.com/aiden-git/workbuddy-cli-proxy` (no trailing slash, no `.git`).
 - Root `registry.json` is the private `store-sources` entry point; version field is display fallback only — real version comes from GitHub latest release tag `v*`.
 
 ## Docs to read first

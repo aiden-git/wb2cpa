@@ -378,8 +378,8 @@ func wbRegistration() registration {
 		Metadata: pluginapi.Metadata{
 			Name:             providerName,
 			Version:          pluginVersion,
-			Author:           "WslzGmzs (clean-room rebuild; original workbuddy by Sliverkiss)",
-			GitHubRepository: "https://github.com/WslzGmzs/workbuddy-cli-proxy",
+			Author:           "aiden-git (clean-room rebuild; original workbuddy by Sliverkiss)",
+			GitHubRepository: "https://github.com/aiden-git/workbuddy-cli-proxy",
 		},
 		Capabilities: registrationCapability{
 			ModelProvider: true,
