@@ -80,8 +80,8 @@ import (
 
 // pluginVersion is injected at link time for release builds:
 //
-//	-ldflags "-X main.pluginVersion=0.5.0"
-var pluginVersion = "0.5.0"
+//	-ldflags "-X main.pluginVersion=0.5.1"
+var pluginVersion = "0.5.1"
 
 const (
 	providerName   = "workbuddy"
@@ -3510,11 +3510,363 @@ func handleSaveAPIKey(body []byte) ([]byte, error) {
 	})
 }
 
-// apiKeyPageHTML is served at /v0/resource/plugins/workbuddy/api-key
-// (management menu: "WorkBuddy API Key"). Uses same-origin fetch with the
-// management token from the parent management UI when available.
-const apiKeyPageHTML = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>WorkBuddy 管理</title><style>:root{font-family:system-ui,sans-serif;color-scheme:light dark;--bg:#f4f4f5;--card:#fff;--border:#ddd;--text:#111;--muted:#555;--btn:#111;--btnfg:#fff}@media(prefers-color-scheme:dark){:root{--bg:#09090b;--card:#18181b;--border:#333;--text:#fafafa;--muted:#aaa;--btn:#fafafa;--btnfg:#09090b}}html[data-theme=dark]{--bg:#09090b;--card:#18181b;--border:#333;--text:#fafafa;--muted:#aaa;--btn:#fafafa;--btnfg:#09090b}html[data-theme=light]{--bg:#f4f4f5;--card:#fff;--border:#ddd;--text:#111;--muted:#555;--btn:#111;--btnfg:#fff}body{max-width:1000px;margin:28px auto;padding:0 16px;background:var(--bg);color:var(--text)}.card{background:var(--card);border:1px solid var(--border);padding:16px;border-radius:10px;margin:12px 0}.row,.tabs,.summary{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.tabs{margin:16px 0}button{padding:9px 12px;border:0;border-radius:6px;background:var(--btn);color:var(--btnfg);font-weight:600;cursor:pointer}.secondary{background:transparent;color:var(--text);border:1px solid var(--border)}.active{outline:2px solid var(--text)}input,textarea,select{box-sizing:border-box;width:100%;padding:9px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text)}label{display:block;margin:10px 0 4px;color:var(--muted);font-size:13px}.metric{min-width:120px;border:1px solid var(--border);border-radius:7px;padding:8px}.metric small{color:var(--muted)}.metric strong{display:block;margin-top:4px}.badge{font-size:12px;border:1px solid var(--border);border-radius:99px;padding:2px 6px;margin:2px}.models{width:100%;border-collapse:collapse;margin-top:12px;font-size:12px}.models th,.models td{border-top:1px solid var(--border);padding:7px;text-align:left}.err{color:#c22}.ok{color:#187a35}.muted,p{color:var(--muted);font-size:13px}textarea{min-height:72px;font-family:ui-monospace,monospace}.panel[hidden]{display:none}</style></head><body><div class="row"><div><h1>WorkBuddy 管理</h1><p>套餐和积分余额仅由插件后端用 OAuth 凭据查询；网页不会获得 API Key 或 Token。</p></div><button class="secondary" onclick="theme()">深色/浅色</button></div><div class="card"><label>Management Token（与 CPA 管理面板相同）</label><div class="row"><input id="token" placeholder="Bearer token / management key" style="max-width:500px"><button class="secondary" onclick="load(false)">加载账户</button><button class="secondary" onclick="load(true)">刷新全部</button><span id="message"></span></div></div><div class="tabs"><button class="tab active" data-id="overview" onclick="tab('overview')">账户概览</button><button class="tab" data-id="login" onclick="tab('login')">OAuth 登录</button><button class="tab" data-id="key" onclick="tab('key')">添加 API Key</button></div><section class="panel" id="overview"><div class="summary" id="summary"></div><div id="accounts"><p>填写 Management Token 后加载账户。</p></div></section><section class="panel" id="login" hidden><div class="card"><h2>OAuth 登录</h2><p>请选择账号所属区域，完成浏览器授权后本页会自动保存凭据。</p><button onclick="login('cn')">登录国内版（CodeBuddy）</button><button class="secondary" onclick="login('global')">登录国际版（WorkBuddy）</button><p id="loginMsg"></p></div></section><section class="panel" id="key" hidden><div class="card"><h2>添加 API Key</h2><p>API Key 可用于模型调用；上游未确认它支持套餐/积分余额接口，因此概览会明确标记为不支持。</p><label>CodeBuddy API Key</label><textarea id="keyValue" placeholder="粘贴 API Key"></textarea><label>区域</label><select id="domain"><option value="copilot.tencent.com">国内版</option><option value="www.workbuddy.ai">国际版</option></select><label>User ID（可选，默认 anonymous）</label><input id="uid" value="anonymous"><label>prefix（可选）</label><input id="prefix"><label>proxy_url（可选）</label><input id="proxy" placeholder="http://127.0.0.1:7890"><label>priority（可选）</label><input id="priority" type="number" placeholder="0"><label>excluded_models（可选，逗号分隔）</label><input id="excluded"><label>model_aliases JSON（可选）</label><textarea id="aliases" placeholder='[{"name":"hy3-preview-agent","alias":"hy3"}]'></textarea><label><input id="disabled" type="checkbox" style="width:auto"> 创建后立即禁用</label><button id="save" onclick="save()">保存 API Key</button><span id="keyMsg"></span></div></section><script>const base='/v0/management/workbuddy/';let timer;(()=>{const q=new URLSearchParams(location.search);let v=q.get('token')||q.get('management_key')||'';try{v=v||localStorage.getItem('management_key')||localStorage.getItem('cpa_management_key')||'';const t=localStorage.getItem('wb_theme');if(t)document.documentElement.dataset.theme=t}catch(e){}token.value=v})();function theme(){let t=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=t;try{localStorage.setItem('wb_theme',t)}catch(e){}}function tab(id){document.querySelectorAll('.panel').forEach(x=>x.hidden=x.id!==id);document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.id===id));if(id==='overview')load(false)}function msg(id,s,bad){const x=document.getElementById(id);x.textContent=s;x.className=bad?'err':'ok'}async function call(path,method='GET',body){if(!token.value.trim())throw Error('请填写 Management Token');const r=await fetch(base+path,{method,headers:{Authorization:'Bearer '+token.value.trim(),'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const d=await r.json();if(!r.ok)throw Error(d.error||'HTTP '+r.status);return d}function add(p,t,v){let x=document.createElement('div');x.className='metric';x.innerHTML='<small></small><strong></strong>';x.children[0].textContent=t;x.children[1].textContent=v;p.append(x)}function value(v){return v===undefined||v===null||v===''?'—':String(v)}function credits(v){return v?value(v.remaining)+' / '+value(v.total)+' '+value(v.unit):'暂未提供'}function render(items){summary.replaceChildren();accounts.replaceChildren();let cn=0,gl=0,on=0;items.forEach(a=>{a.realm==='global'?gl++:cn++;if(!a.disabled)on++});[['凭据',items.length],['可用',on],['国内版',cn],['国际版',gl]].forEach(x=>add(summary,x[0],x[1]));if(!items.length){accounts.textContent='尚未保存 WorkBuddy 凭据。';return}items.forEach(a=>{let c=document.createElement('article');c.className='card';let h=document.createElement('h2');h.textContent=value(a.label);c.append(h);let b=document.createElement('div');b.className='row';[a.realm,a.auth_type,a.disabled?'已禁用':'已启用'].forEach(x=>{let z=document.createElement('span');z.className='badge';z.textContent=value(x);b.append(z)});c.append(b);let g=document.createElement('div');g.className='summary';[['账号',value(a.nickname)||value(a.uid)],['套餐',value(a.plan)],['积分余额',credits(a.balance)],['企业额度',credits(a.enterprise)],['周期',a.cycle_start||a.cycle_end?value(a.cycle_start)+' ~ '+value(a.cycle_end):'—']].forEach(x=>add(g,x[0],x[1]));c.append(g);if(a.error){let p=document.createElement('p');p.textContent=a.error;p.className=a.unsupported?'muted':'err';c.append(p)}if(a.models&&a.models.length){let t=document.createElement('table');t.className='models';t.innerHTML='<thead><tr><th>模型</th><th>倍率</th><th>上下文</th><th>最大输出</th><th>能力</th></tr></thead>';let body=document.createElement('tbody');a.models.forEach(m=>{let tr=document.createElement('tr');[m.name||m.id,m.credits||'—',m.context||'—',m.max_output||'—',[m.images?'图片':'',m.reasoning?'推理':'',m.tool_call?'工具':''].filter(Boolean).join(' / ')||'—'].forEach(v=>{let td=document.createElement('td');td.textContent=String(v);tr.append(td)});body.append(tr)});t.append(body);c.append(t)}let r=document.createElement('button');r.className='secondary';r.textContent='刷新此账户';r.onclick=()=>load(true,a.id);c.append(r);accounts.append(c)})}async function load(force,id=''){try{msg('message','加载中…');let d=await call(force?'accounts/refresh':'accounts',force?'POST':'GET',force?{id}:null);render(d.accounts||[]);msg('message','已更新')}catch(e){msg('message',e.message,true)}}async function login(realm){try{msg('loginMsg','正在创建登录会话…');let d=await call('oauth/start','POST',{realm});let win=open(d.url,'workbuddy-login');if(!win)msg('loginMsg','请允许浏览器打开登录窗口。',true);else msg('loginMsg','已打开登录窗口，正在等待授权…');clearInterval(timer);timer=setInterval(()=>poll(d.state),2500)}catch(e){msg('loginMsg',e.message,true)}}async function poll(state){try{let d=await call('oauth/poll','POST',{state});if(d.status==='success'){clearInterval(timer);msg('loginMsg','登录成功，凭据已保存。');tab('overview');load(true)}else if(d.status==='error'){clearInterval(timer);msg('loginMsg',d.message||'登录失败',true)}}catch(e){clearInterval(timer);msg('loginMsg',e.message,true)}}async function save(){let key=keyValue.value.trim();if(!key){msg('keyMsg','请填写 API Key',true);return}let button=document.getElementById('save');try{let aliases=document.getElementById('aliases').value.trim(),priorityInput=document.getElementById('priority'),excludedInput=document.getElementById('excluded');let body={api_key:key,user_id:uid.value.trim()||'anonymous',domain:domain.value,prefix:prefix.value.trim(),proxy_url:proxy.value.trim(),disabled:document.getElementById('disabled').checked};if(priorityInput.value.trim())body.priority=Number(priorityInput.value);if(excludedInput.value.trim())body.excluded_models=excludedInput.value.split(/[ ,
-]/).map(x=>x.trim()).filter(Boolean);if(aliases)body.model_aliases=JSON.parse(aliases);button.disabled=true;let d=await call('api-key','POST',body);keyValue.value='';msg('keyMsg','已保存：'+(d.fileName||d.id||''));load(true)}catch(e){msg('keyMsg',e.message,true)}finally{button.disabled=false}}</script></body></html>`
+// apiKeyPageHTML is served at /v0/resource/plugins/workbuddy/api-key.
+// It reuses the current CPA control-panel authorization in same-origin browser
+// storage without rendering, persisting, or forwarding that authorization.
+const apiKeyPageHTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>WorkBuddy 管理</title>
+<style>
+:root{font-family:system-ui,sans-serif;color-scheme:light dark;--bg:#f4f4f5;--card:#fff;--border:#ddd;--text:#111;--muted:#555;--btn:#111;--btnfg:#fff}
+@media(prefers-color-scheme:dark){:root{--bg:#09090b;--card:#18181b;--border:#333;--text:#fafafa;--muted:#aaa;--btn:#fafafa;--btnfg:#09090b}}
+html[data-theme=dark]{--bg:#09090b;--card:#18181b;--border:#333;--text:#fafafa;--muted:#aaa;--btn:#fafafa;--btnfg:#09090b}
+html[data-theme=light]{--bg:#f4f4f5;--card:#fff;--border:#ddd;--text:#111;--muted:#555;--btn:#111;--btnfg:#fff}
+body{max-width:1000px;margin:28px auto;padding:0 16px;background:var(--bg);color:var(--text)}
+.card{background:var(--card);border:1px solid var(--border);padding:16px;border-radius:10px;margin:12px 0}
+.row,.tabs,.summary{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.tabs{margin:16px 0}
+button{padding:9px 12px;border:0;border-radius:6px;background:var(--btn);color:var(--btnfg);font-weight:600;cursor:pointer}
+button:disabled{cursor:not-allowed;opacity:.55}.secondary{background:transparent;color:var(--text);border:1px solid var(--border)}.active{outline:2px solid var(--text)}
+input,textarea,select{box-sizing:border-box;width:100%;padding:9px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text)}
+label{display:block;margin:10px 0 4px;color:var(--muted);font-size:13px}.metric{min-width:120px;border:1px solid var(--border);border-radius:7px;padding:8px}.metric small{color:var(--muted)}.metric strong{display:block;margin-top:4px}
+.badge{font-size:12px;border:1px solid var(--border);border-radius:99px;padding:2px 6px;margin:2px}.models{width:100%;border-collapse:collapse;margin-top:12px;font-size:12px}.models th,.models td{border-top:1px solid var(--border);padding:7px;text-align:left}
+.err{color:#c22}.ok{color:#187a35}.muted,p{color:var(--muted);font-size:13px}textarea{min-height:72px;font-family:ui-monospace,monospace}.panel[hidden]{display:none}.actions{margin-top:8px}
+</style>
+</head>
+<body>
+<div class="row">
+  <div>
+    <h1>WorkBuddy 管理</h1>
+    <p>页面不会显示、保存或向上游发送 API Key、OAuth Token 或管理密钥；仅在浏览器内复用已登录 CPA 管理中心的授权访问同源管理 API。</p>
+  </div>
+  <button class="secondary" onclick="toggleTheme()">深色/浅色</button>
+</div>
+<div class="card">
+  <div class="row">
+    <div>
+      <h2>账户概览</h2>
+      <p>套餐和积分余额仅由插件后端用 OAuth 凭据查询。</p>
+    </div>
+  </div>
+  <div class="row actions">
+    <button class="secondary" onclick="loadAccounts(false)">加载账户</button>
+    <button class="secondary" onclick="loadAccounts(true)">刷新全部</button>
+    <span id="message" role="status" aria-live="polite"></span>
+  </div>
+</div>
+<div class="tabs">
+  <button class="tab active" data-id="overview" onclick="switchTab('overview')">账户概览</button>
+  <button class="tab" data-id="login" onclick="switchTab('login')">OAuth 登录</button>
+  <button class="tab" data-id="key" onclick="switchTab('key')">添加 API Key</button>
+</div>
+<section class="panel" id="overview">
+  <div class="summary" id="summary"></div>
+  <div id="accounts"><p>正在加载账户…</p></div>
+</section>
+<section class="panel" id="login" hidden>
+  <div class="card">
+    <h2>OAuth 登录</h2>
+    <p>请选择账号所属区域，完成浏览器授权后本页会自动保存凭据。</p>
+    <button onclick="startLogin('cn')">登录国内版（CodeBuddy）</button>
+    <button class="secondary" onclick="startLogin('global')">登录国际版（WorkBuddy）</button>
+    <p id="loginMsg" role="status" aria-live="polite"></p>
+  </div>
+</section>
+<section class="panel" id="key" hidden>
+  <div class="card">
+    <h2>添加 API Key</h2>
+    <p>API Key 可用于模型调用；上游未确认它支持套餐/积分余额接口，因此概览会明确标记为不支持。</p>
+    <label>CodeBuddy API Key</label><textarea id="keyValue" placeholder="粘贴 API Key"></textarea>
+    <label>区域</label><select id="domain"><option value="copilot.tencent.com">国内版</option><option value="www.workbuddy.ai">国际版</option></select>
+    <label>User ID（可选，默认 anonymous）</label><input id="uid" value="anonymous">
+    <label>prefix（可选）</label><input id="prefix">
+    <label>proxy_url（可选）</label><input id="proxy" placeholder="http://127.0.0.1:7890">
+    <label>priority（可选）</label><input id="priority" type="number" placeholder="0">
+    <label>excluded_models（可选，逗号分隔）</label><input id="excluded">
+    <label>model_aliases JSON（可选）</label><textarea id="aliases" placeholder='[{"name":"hy3-preview-agent","alias":"hy3"}]'></textarea>
+    <label><input id="disabled" type="checkbox" style="width:auto"> 创建后立即禁用</label>
+    <button id="saveKey" onclick="saveAPIKey()">保存 API Key</button>
+    <span id="keyMsg" role="status" aria-live="polite"></span>
+  </div>
+</section>
+<script>
+const base = '/v0/management/workbuddy/';
+const panelAuthStorageKey = 'cli-proxy-auth';
+const panelAuthPrefix = 'enc::v1::';
+const panelAuthSalt = 'cli-proxy-api-webui::secure-storage';
+const summaryEl = document.getElementById('summary');
+const accountsEl = document.getElementById('accounts');
+const keyValueEl = document.getElementById('keyValue');
+const domainEl = document.getElementById('domain');
+const uidEl = document.getElementById('uid');
+const prefixEl = document.getElementById('prefix');
+const proxyEl = document.getElementById('proxy');
+const priorityEl = document.getElementById('priority');
+const excludedEl = document.getElementById('excluded');
+const aliasesEl = document.getElementById('aliases');
+const disabledEl = document.getElementById('disabled');
+const saveKeyEl = document.getElementById('saveKey');
+let managementKey = '';
+let loginTimer;
+
+function setMessage(id, text, bad) {
+  const element = document.getElementById(id);
+  element.textContent = text;
+  element.className = bad ? 'err' : 'ok';
+}
+
+function restoreTheme() {
+  try {
+    const theme = localStorage.getItem('wb_theme');
+    if (theme) document.documentElement.dataset.theme = theme;
+  } catch (_) {}
+}
+
+function toggleTheme() {
+  const theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = theme;
+  try { localStorage.setItem('wb_theme', theme); } catch (_) {}
+}
+
+function decodePanelAuth(value) {
+  let decoded = value;
+  if (decoded.startsWith(panelAuthPrefix)) {
+    const encrypted = atob(decoded.slice(panelAuthPrefix.length));
+    const key = new TextEncoder().encode(panelAuthSalt + '|' + location.host + '|' + navigator.userAgent);
+    const bytes = new Uint8Array(encrypted.length);
+    for (let index = 0; index < encrypted.length; index += 1) {
+      bytes[index] = encrypted.charCodeAt(index) ^ key[index % key.length];
+    }
+    decoded = new TextDecoder().decode(bytes);
+  }
+  return JSON.parse(decoded);
+}
+
+function readPanelManagementKey() {
+  try {
+    const saved = localStorage.getItem(panelAuthStorageKey);
+    if (saved) {
+      const auth = decodePanelAuth(saved);
+      const key = auth && auth.state ? auth.state.managementKey : auth && auth.managementKey;
+      if (typeof key === 'string' && key.trim()) return key.trim();
+    }
+    for (const storageKey of ['managementKey', 'management_key', 'cpa_management_key']) {
+      const key = localStorage.getItem(storageKey);
+      if (key && key.trim()) return key.trim();
+    }
+  } catch (_) {}
+  return '';
+}
+
+function switchTab(id, refreshOverview) {
+  document.querySelectorAll('.panel').forEach((panel) => { panel.hidden = panel.id !== id; });
+  document.querySelectorAll('.tab').forEach((tab) => { tab.classList.toggle('active', tab.dataset.id === id); });
+  if (id === 'overview' && refreshOverview !== false) loadAccounts(false);
+}
+
+function managementError(status, payload) {
+  if (status === 401 || status === 403) return 'CPA 管理授权已失效，请重新登录管理中心并启用“记住密码”。';
+  if (status === 404) return 'CPA 管理 API 未启用。请配置管理密码后重新打开此页。';
+  if (payload && typeof payload.error === 'string' && payload.error) return payload.error;
+  return '管理请求失败（HTTP ' + status + '）。';
+}
+
+async function callManagement(path, method, body) {
+  if (!managementKey) {
+    throw new Error('未检测到 CPA 管理授权。请在管理中心登录时启用“记住密码”，然后刷新本页。');
+  }
+  const response = await fetch(base + path, {
+    method: method || 'GET',
+    headers: { Authorization: 'Bearer ' + managementKey, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await response.text();
+  let payload = null;
+  if (text) {
+    try { payload = JSON.parse(text); } catch (_) {}
+  }
+  if (!response.ok) throw new Error(managementError(response.status, payload));
+  if (!payload) throw new Error('管理服务返回了无法识别的响应，请刷新页面后重试。');
+  return payload;
+}
+
+function addMetric(parent, title, value) {
+  const item = document.createElement('div');
+  item.className = 'metric';
+  const label = document.createElement('small');
+  const strong = document.createElement('strong');
+  label.textContent = title;
+  strong.textContent = value;
+  item.append(label, strong);
+  parent.append(item);
+}
+
+function displayValue(value) {
+  return value === undefined || value === null || value === '' ? '—' : String(value);
+}
+
+function displayCredits(value) {
+  return value ? displayValue(value.remaining) + ' / ' + displayValue(value.total) + ' ' + displayValue(value.unit) : '暂未提供';
+}
+
+function renderAccounts(items) {
+  summaryEl.replaceChildren();
+  accountsEl.replaceChildren();
+  let cn = 0;
+  let global = 0;
+  let enabled = 0;
+  items.forEach((account) => {
+    if (account.realm === 'global') global += 1; else cn += 1;
+    if (!account.disabled) enabled += 1;
+  });
+  [['凭据', items.length], ['可用', enabled], ['国内版', cn], ['国际版', global]].forEach((item) => addMetric(summaryEl, item[0], item[1]));
+  if (!items.length) {
+    accountsEl.textContent = '尚未保存 WorkBuddy 凭据。';
+    return;
+  }
+  items.forEach((account) => {
+    const card = document.createElement('article');
+    card.className = 'card';
+    const heading = document.createElement('h2');
+    heading.textContent = displayValue(account.label);
+    card.append(heading);
+    const badges = document.createElement('div');
+    badges.className = 'row';
+    [account.realm, account.auth_type, account.disabled ? '已禁用' : '已启用'].forEach((badge) => {
+      const element = document.createElement('span');
+      element.className = 'badge';
+      element.textContent = displayValue(badge);
+      badges.append(element);
+    });
+    card.append(badges);
+    const metrics = document.createElement('div');
+    metrics.className = 'summary';
+    const identity = account.nickname || account.uid || '—';
+    [['账号', identity], ['套餐', displayValue(account.plan)], ['积分余额', displayCredits(account.balance)], ['企业额度', displayCredits(account.enterprise)], ['周期', account.cycle_start || account.cycle_end ? displayValue(account.cycle_start) + ' ~ ' + displayValue(account.cycle_end) : '—']].forEach((item) => addMetric(metrics, item[0], item[1]));
+    card.append(metrics);
+    if (account.error) {
+      const error = document.createElement('p');
+      error.textContent = account.error;
+      error.className = account.unsupported ? 'muted' : 'err';
+      card.append(error);
+    }
+    if (account.models && account.models.length) {
+      const table = document.createElement('table');
+      table.className = 'models';
+      table.innerHTML = '<thead><tr><th>模型</th><th>倍率</th><th>上下文</th><th>最大输出</th><th>能力</th></tr></thead>';
+      const body = document.createElement('tbody');
+      account.models.forEach((model) => {
+        const row = document.createElement('tr');
+        [model.name || model.id, model.credits || '—', model.context || '—', model.max_output || '—', [model.images ? '图片' : '', model.reasoning ? '推理' : '', model.tool_call ? '工具' : ''].filter(Boolean).join(' / ') || '—'].forEach((value) => {
+          const cell = document.createElement('td');
+          cell.textContent = String(value);
+          row.append(cell);
+        });
+        body.append(row);
+      });
+      table.append(body);
+      card.append(table);
+    }
+    const refresh = document.createElement('button');
+    refresh.className = 'secondary';
+    refresh.textContent = '刷新此账户';
+    refresh.onclick = () => loadAccounts(true, account.id);
+    card.append(refresh);
+    accountsEl.append(card);
+  });
+}
+
+async function loadAccounts(force, id) {
+  try {
+    setMessage('message', '加载中…');
+    const response = await callManagement(force ? 'accounts/refresh' : 'accounts', force ? 'POST' : 'GET', force ? { id: id || '' } : null);
+    renderAccounts(response.accounts || []);
+    setMessage('message', '已更新');
+  } catch (error) {
+    setMessage('message', error.message, true);
+  }
+}
+
+async function startLogin(realm) {
+  try {
+    setMessage('loginMsg', '正在创建登录会话…');
+    const response = await callManagement('oauth/start', 'POST', { realm: realm });
+    const popup = window.open(response.url, 'workbuddy-login');
+    if (!popup) {
+      setMessage('loginMsg', '请允许浏览器打开登录窗口。', true);
+      return;
+    }
+    setMessage('loginMsg', '已打开登录窗口，正在等待授权…');
+    clearInterval(loginTimer);
+    loginTimer = setInterval(() => pollLogin(response.state), 2500);
+  } catch (error) {
+    setMessage('loginMsg', error.message, true);
+  }
+}
+
+async function pollLogin(state) {
+  try {
+    const response = await callManagement('oauth/poll', 'POST', { state: state });
+    if (response.status === 'success') {
+      clearInterval(loginTimer);
+      setMessage('loginMsg', '登录成功，凭据已保存。');
+      switchTab('overview', false);
+      loadAccounts(true);
+    } else if (response.status === 'error') {
+      clearInterval(loginTimer);
+      setMessage('loginMsg', response.message || '登录失败', true);
+    }
+  } catch (error) {
+    clearInterval(loginTimer);
+    setMessage('loginMsg', error.message, true);
+  }
+}
+
+async function saveAPIKey() {
+  const key = keyValueEl.value.trim();
+  if (!key) {
+    setMessage('keyMsg', '请填写 API Key', true);
+    return;
+  }
+  try {
+    const aliases = aliasesEl.value.trim();
+    const body = {
+      api_key: key,
+      user_id: uidEl.value.trim() || 'anonymous',
+      domain: domainEl.value,
+      prefix: prefixEl.value.trim(),
+      proxy_url: proxyEl.value.trim(),
+      disabled: disabledEl.checked,
+    };
+    if (priorityEl.value.trim()) body.priority = Number(priorityEl.value);
+    if (excludedEl.value.trim()) body.excluded_models = excludedEl.value.split(',').map((value) => value.trim()).filter(Boolean);
+    if (aliases) body.model_aliases = JSON.parse(aliases);
+    saveKeyEl.disabled = true;
+    const response = await callManagement('api-key', 'POST', body);
+    keyValueEl.value = '';
+    setMessage('keyMsg', '已保存：' + (response.fileName || response.id || ''));
+    loadAccounts(true);
+  } catch (error) {
+    setMessage('keyMsg', error.message, true);
+  } finally {
+    saveKeyEl.disabled = false;
+  }
+}
+
+restoreTheme();
+managementKey = readPanelManagementKey();
+if (managementKey) {
+  loadAccounts(false);
+} else {
+  accountsEl.textContent = '未检测到 CPA 管理授权。请在管理中心登录时启用“记住密码”，然后刷新本页。';
+  setMessage('message', '未检测到已保存的 CPA 管理授权。', true);
+}
+</script>
+</body>
+</html>`
 
 // -----------------------------------------------------------------------------
 // envelope helpers

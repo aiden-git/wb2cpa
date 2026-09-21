@@ -56,7 +56,7 @@ OAuth 登录后 `domain` 由服务端下发；API Key 模式在凭据 JSON 里�
 - `checksums.txt`（sha256sum 格式）
 
 ```bash
-git tag v0.5.0 && git push origin v0.5.0
+git tag v0.5.1 && git push origin v0.5.1
 ```
 
 没有 Release 资产时，商店能看到插件，但安装会失败。
@@ -109,14 +109,14 @@ make build
 # → dist/workbuddy.so | .dylib | .dll
 
 # 指定平台并打成商店兼容 zip
-make package VERSION=0.5.0 GOOS=linux GOARCH=amd64
+make package VERSION=0.5.1 GOOS=linux GOARCH=amd64
 ```
 
 也可手写：
 
 ```bash
 CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-  go build -buildmode=c-shared -ldflags "-s -w -X main.pluginVersion=0.5.0" \
+  go build -buildmode=c-shared -ldflags "-s -w -X main.pluginVersion=0.5.1" \
   -o workbuddy.so .
 ```
 
@@ -126,7 +126,7 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
 
 ### 1. 管理页 OAuth 登录（国内版 / 国际版）
 
-打开下面的 WorkBuddy 管理页，填写 Management Token 后，在 **OAuth 登录** 标签选择：
+在 CPA 管理中心完成登录并勾选“记住密码”后，打开下面的 WorkBuddy 管理页。页面会在同源浏览器内自动复用管理授权，无需手动填写或粘贴 Management Token；在 **OAuth 登录** 标签选择：
 
 - **登录国内版（CodeBuddy）**：`copilot.tencent.com`
 - **登录国际版（WorkBuddy）**：`www.workbuddy.ai`
@@ -160,7 +160,7 @@ CPA 自带的 OAuth「回调 URL / 授权码」框 **不能** 用来贴 Key：�
 
 #### 管理菜单
 
-加载插件后，管理端会出现 **WorkBuddy 管理**。在 **添加 API Key** 标签填写 Management Token 与 Key 即可保存；旧的资源路径保持兼容。
+加载插件后，管理端会出现 **WorkBuddy 管理**。当 CPA 管理中心已登录且启用“记住密码”时，页面会自动复用该授权；在 **添加 API Key** 标签填写 Key 即可保存，无需粘贴 Management Token。若页面提示未检测到授权，请返回管理中心重新登录并启用“记住密码”，再刷新此页；旧的资源路径保持兼容。
 
 #### HTTP API（需 management Bearer）
 
@@ -340,7 +340,7 @@ CPA 宿主本身支持 401/402/429 后冷却并换下一张 workbuddy 凭据，�
 2. 打 tag 并推送 —— `wb2cpa` 是独立仓库（非 fork），tag push 会**自动**触发构建：
 
 ```bash
-git tag -a v0.5.0 -m "wb2cpa v0.5.0" && git push origin v0.5.0
+git tag -a v0.5.1 -m "wb2cpa v0.5.1" && git push origin v0.5.1
 ```
 
 3. GitHub Actions（`.github/workflows/build.yml`）构建 6 个平台 zip + `checksums.txt` 并创建 Release
@@ -356,7 +356,7 @@ git tag -a v0.5.0 -m "wb2cpa v0.5.0" && git push origin v0.5.0
 | 项 | 要求 |
 |----|------|
 | 插件 ID | `workbuddy`（与文件名 / zip 内库名一致） |
-| Release tag | `v<version>`，如 `v0.5.0` |
+| Release tag | `v<version>`，如 `v0.5.1` |
 | 资产名 | `workbuddy_<version>_<goos>_<goarch>.zip` |
 | zip 内容 | 根目录仅 `workbuddy.so` / `.dylib` / `.dll` |
 | 校验 | `checksums.txt`（sha256sum 格式） |

@@ -4,12 +4,12 @@
 #   make build
 #
 # Cross-ish local package (requires a C toolchain for GOOS/GOARCH):
-#   make package VERSION=0.5.0 GOOS=linux GOARCH=amd64
+#   make package VERSION=0.5.1 GOOS=linux GOARCH=amd64
 #
 # Plugin store asset name: workbuddy_<version>_<goos>_<goarch>.zip
 
 PLUGIN_ID ?= workbuddy
-VERSION   ?= 0.5.0
+VERSION   ?= 0.5.1
 GOOS      ?= $(shell go env GOOS)
 GOARCH    ?= $(shell go env GOARCH)
 

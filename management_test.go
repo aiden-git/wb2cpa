@@ -55,6 +55,60 @@ func TestManagementRegistrationIncludesOverviewRoutes(t *testing.T) {
 	}
 }
 
+func TestManagementResourcePageUsesPanelAuthorization(t *testing.T) {
+	rawReq, err := json.Marshal(managementHandleRequest{
+		Method: "GET",
+		Path:   "/v0/resource/plugins/workbuddy/api-key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := handleManagement(rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var outer envelope
+	if err := json.Unmarshal(raw, &outer); err != nil || !outer.OK {
+		t.Fatalf("resource envelope = %s, err = %v", raw, err)
+	}
+	var response managementHandleResponse
+	if err := json.Unmarshal(outer.Result, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != 200 {
+		t.Fatalf("resource status = %d, want 200", response.StatusCode)
+	}
+	if got := response.Headers["Content-Type"]; len(got) != 1 || got[0] != "text/html; charset=utf-8" {
+		t.Fatalf("resource Content-Type = %#v", got)
+	}
+
+	page := string(response.Body)
+	for _, forbidden := range []string{
+		`id="token"`,
+		`Management Token`,
+		`q.get(`,
+		`请填写 Management Token`,
+		`split(/[`,
+	} {
+		if strings.Contains(page, forbidden) {
+			t.Fatalf("management page still contains forbidden %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		`cli-proxy-auth`,
+		`enc::v1::`,
+		`cli-proxy-api-webui::secure-storage`,
+		`Authorization: 'Bearer ' + managementKey`,
+		`function loadAccounts`,
+		`onclick="startLogin('cn')"`,
+		`split(',')`,
+	} {
+		if !strings.Contains(page, required) {
+			t.Fatalf("management page missing %q", required)
+		}
+	}
+}
+
 func TestMaskAccountIdentifier(t *testing.T) {
 	if got := maskAccountIdentifier("123456789"); got != "123…6789" {
 		t.Fatalf("maskAccountIdentifier leaked or malformed: %q", got)
