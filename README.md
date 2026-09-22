@@ -56,7 +56,7 @@ OAuth 登录后 `domain` 由服务端下发；API Key 模式在凭据 JSON 里�
 - `checksums.txt`（sha256sum 格式）
 
 ```bash
-git tag v0.6.0 && git push origin v0.6.0
+git tag v0.7.0 && git push origin v0.7.0
 ```
 
 没有 Release 资产时，商店能看到插件，但安装会失败。
@@ -109,14 +109,14 @@ make build
 # → dist/workbuddy.so | .dylib | .dll
 
 # 指定平台并打成商店兼容 zip
-make package VERSION=0.6.0 GOOS=linux GOARCH=amd64
+make package VERSION=0.7.0 GOOS=linux GOARCH=amd64
 ```
 
 也可手写：
 
 ```bash
 CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-  go build -buildmode=c-shared -ldflags "-s -w -X main.pluginVersion=0.6.0" \
+  go build -buildmode=c-shared -ldflags "-s -w -X main.pluginVersion=0.7.0" \
   -o workbuddy.so .
 ```
 
@@ -139,6 +139,7 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
 
 - 套餐/余额只为 **OAuth** 凭据查询：CN 账单请求走 `https://www.codebuddy.cn`，国际版走 `https://www.workbuddy.ai`。
 - OAuth 凭据会额外列出“平台积分明细”：每条积分包的已用/总量、剩余量、可用状态与**周期结束**。周期结束不是奖励到期时间；上游确认真实到期字段前，页面不会伪造该信息。
+- 动态模型列表提供时，模型表会逐项显示上游明确声明的推理档位和默认档位；未提供时显示“暂未提供”，不会依据模型名称或请求重写规则猜测。
 - **API Key** 凭据会明确显示“暂不支持套餐与积分余额查询”，而不是误报为零。
 - Token、API Key、完整认证文件和原始账单响应不会输出到浏览器、页面或 API 响应；账户结果仅缓存在插件内存中（成功 3 分钟，失败 30 秒）。
 
@@ -343,7 +344,7 @@ CPA 宿主本身支持 401/402/429 后冷却并换下一张 workbuddy 凭据，�
 2. 打 tag 并推送 —— `wb2cpa` 是独立仓库（非 fork），tag push 会**自动**触发构建：
 
 ```bash
-git tag -a v0.6.0 -m "wb2cpa v0.6.0" && git push origin v0.6.0
+git tag -a v0.7.0 -m "wb2cpa v0.7.0" && git push origin v0.7.0
 ```
 
 3. GitHub Actions（`.github/workflows/build.yml`）构建 6 个平台 zip + `checksums.txt` 并创建 Release
@@ -359,7 +360,7 @@ git tag -a v0.6.0 -m "wb2cpa v0.6.0" && git push origin v0.6.0
 | 项 | 要求 |
 |----|------|
 | 插件 ID | `workbuddy`（与文件名 / zip 内库名一致） |
-| Release tag | `v<version>`，如 `v0.6.0` |
+| Release tag | `v<version>`，如 `v0.7.0` |
 | 资产名 | `workbuddy_<version>_<goos>_<goarch>.zip` |
 | zip 内容 | 根目录仅 `workbuddy.so` / `.dylib` / `.dll` |
 | 校验 | `checksums.txt`（sha256sum 格式） |

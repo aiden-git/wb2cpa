@@ -115,6 +115,9 @@ func TestManagementResourcePageUsesPanelAuthorization(t *testing.T) {
 		`globalLoginEntry`,
 		`credit_packages`,
 		`平台积分明细`,
+		`function displayReasoningEfforts`,
+		`reasoning_efforts`,
+		`推理档位`,
 		`split(',')`,
 	} {
 		if !strings.Contains(page, required) {
@@ -163,6 +166,29 @@ func TestMaskAccountIdentifier(t *testing.T) {
 	}
 }
 
+func TestReasoningEffortsFor(t *testing.T) {
+	model := dynModelEntry{}
+	model.Reasoning.DefaultEffort = " medium "
+	model.Reasoning.SupportedEfforts = []string{"low", "medium", "high", "medium", " "}
+
+	efforts, defaultEffort := reasoningEffortsFor(model)
+	if got := strings.Join(efforts, ","); got != "low,medium,high" || defaultEffort != "medium" {
+		t.Fatalf("reasoning effort projection = %#v, default = %q", efforts, defaultEffort)
+	}
+
+	model.Reasoning.DefaultEffort = "unsupported"
+	efforts, defaultEffort = reasoningEffortsFor(model)
+	if got := strings.Join(efforts, ","); got != "low,medium,high" || defaultEffort != "" {
+		t.Fatalf("unsupported default must be omitted: %#v, default = %q", efforts, defaultEffort)
+	}
+
+	model.Reasoning.SupportedEfforts = nil
+	efforts, defaultEffort = reasoningEffortsFor(model)
+	if len(efforts) != 0 || defaultEffort != "" {
+		t.Fatalf("missing efforts = %#v, default = %q", efforts, defaultEffort)
+	}
+}
+
 func TestAccountOverviewRedactsAPIKey(t *testing.T) {
 	oldHost := hostCallFn
 	oldModels := modelCacheMap
@@ -178,7 +204,11 @@ func TestAccountOverviewRedactsAPIKey(t *testing.T) {
 		"cn": {
 			fetchedAt: time.Now(),
 			details: []dynModelEntry{{
-				ID: "glm-5.2", Name: "GLM-5.2", Credits: "1.0", MaxInputTokens: 131072, MaxOutputTokens: 8192, SupportsToolCall: true,
+				ID: "glm-5.2", Name: "GLM-5.2", Credits: "1.0", MaxInputTokens: 131072, MaxOutputTokens: 8192, SupportsToolCall: true, SupportsReasoning: true,
+				Reasoning: struct {
+					DefaultEffort    string   `json:"defaultEffort"`
+					SupportedEfforts []string `json:"supportedEfforts"`
+				}{DefaultEffort: "medium", SupportedEfforts: []string{"low", "medium", "high"}},
 			}},
 		},
 	}
@@ -235,6 +265,9 @@ func TestAccountOverviewRedactsAPIKey(t *testing.T) {
 	}
 	if len(account.Models) != 1 || account.Models[0].Credits != "1.0" || !account.Models[0].ToolCall {
 		t.Fatalf("model summary = %#v", account.Models)
+	}
+	if got := strings.Join(account.Models[0].ReasoningEfforts, ","); got != "low,medium,high" || account.Models[0].DefaultReasoningEffort != "medium" {
+		t.Fatalf("reasoning efforts = %#v", account.Models[0])
 	}
 }
 

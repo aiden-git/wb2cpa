@@ -80,8 +80,8 @@ import (
 
 // pluginVersion is injected at link time for release builds:
 //
-//	-ldflags "-X main.pluginVersion=0.6.0"
-var pluginVersion = "0.6.0"
+//	-ldflags "-X main.pluginVersion=0.7.0"
+var pluginVersion = "0.7.0"
 
 const (
 	providerName   = "workbuddy"
@@ -200,15 +200,17 @@ type creditPackageSummary struct {
 }
 
 type modelSummary struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Credits   string `json:"credits,omitempty"`
-	Context   int64  `json:"context"`
-	MaxOutput int64  `json:"max_output"`
-	Images    bool   `json:"images"`
-	Reasoning bool   `json:"reasoning"`
-	ToolCall  bool   `json:"tool_call"`
-	Disabled  bool   `json:"disabled"`
+	ID                     string   `json:"id"`
+	Name                   string   `json:"name"`
+	Credits                string   `json:"credits,omitempty"`
+	Context                int64    `json:"context"`
+	MaxOutput              int64    `json:"max_output"`
+	Images                 bool     `json:"images"`
+	Reasoning              bool     `json:"reasoning"`
+	ReasoningEfforts       []string `json:"reasoning_efforts,omitempty"`
+	DefaultReasoningEffort string   `json:"default_reasoning_effort,omitempty"`
+	ToolCall               bool     `json:"tool_call"`
+	Disabled               bool     `json:"disabled"`
 }
 
 type accountCacheEntry struct {
@@ -1555,6 +1557,33 @@ func maskAccountIdentifier(value string) string {
 	return value[:3] + "…" + value[len(value)-4:]
 }
 
+// reasoningEffortsFor returns explicit upstream reasoning settings suitable for
+// display. It trims and de-duplicates the supported list without inferring
+// support from a model name or request-side reasoning behavior.
+func reasoningEffortsFor(model dynModelEntry) ([]string, string) {
+	seen := make(map[string]struct{}, len(model.Reasoning.SupportedEfforts))
+	efforts := make([]string, 0, len(model.Reasoning.SupportedEfforts))
+	for _, effort := range model.Reasoning.SupportedEfforts {
+		effort = strings.TrimSpace(effort)
+		if effort == "" {
+			continue
+		}
+		if _, exists := seen[effort]; exists {
+			continue
+		}
+		seen[effort] = struct{}{}
+		efforts = append(efforts, effort)
+	}
+	if len(efforts) == 0 {
+		return nil, ""
+	}
+	defaultEffort := strings.TrimSpace(model.Reasoning.DefaultEffort)
+	if _, supported := seen[defaultEffort]; !supported {
+		defaultEffort = ""
+	}
+	return efforts, defaultEffort
+}
+
 func modelSummariesFor(sa *storedAuth) []modelSummary {
 	key := "cn"
 	if isGlobal(sa) {
@@ -1577,7 +1606,20 @@ func modelSummariesFor(sa *storedAuth) []modelSummary {
 	}
 	out := make([]modelSummary, 0, len(details))
 	for _, model := range details {
-		out = append(out, modelSummary{ID: model.ID, Name: firstNonEmpty(model.Name, model.ID), Credits: model.Credits, Context: model.MaxInputTokens, MaxOutput: model.MaxOutputTokens, Images: model.SupportsImages, Reasoning: model.SupportsReasoning, ToolCall: model.SupportsToolCall, Disabled: model.Disabled})
+		efforts, defaultEffort := reasoningEffortsFor(model)
+		out = append(out, modelSummary{
+			ID:                     model.ID,
+			Name:                   firstNonEmpty(model.Name, model.ID),
+			Credits:                model.Credits,
+			Context:                model.MaxInputTokens,
+			MaxOutput:              model.MaxOutputTokens,
+			Images:                 model.SupportsImages,
+			Reasoning:              model.SupportsReasoning,
+			ReasoningEfforts:       efforts,
+			DefaultReasoningEffort: defaultEffort,
+			ToolCall:               model.SupportsToolCall,
+			Disabled:               model.Disabled,
+		})
 	}
 	return out
 }
@@ -3794,6 +3836,16 @@ function displayCredits(value) {
   return displayValue(value.used) + ' / ' + displayValue(value.total) + '（剩余 ' + displayValue(value.remaining) + '）' + ' ' + displayValue(value.unit);
 }
 
+function displayReasoningEfforts(model) {
+  const efforts = Array.isArray(model.reasoning_efforts)
+    ? model.reasoning_efforts.filter((effort) => typeof effort === 'string' && effort)
+    : [];
+  if (!efforts.length) return '暂未提供';
+  const defaultEffort = model.default_reasoning_effort;
+  const summary = efforts.join(' / ');
+  return efforts.includes(defaultEffort) ? summary + '（默认 ' + defaultEffort + '）' : summary;
+}
+
 function renderCreditPackages(account, card) {
   const packages = account.credit_packages;
   if (!packages || !packages.length) return;
@@ -3875,11 +3927,11 @@ function renderAccounts(items) {
     if (account.models && account.models.length) {
       const table = document.createElement('table');
       table.className = 'models';
-      table.innerHTML = '<thead><tr><th>模型</th><th>倍率</th><th>上下文</th><th>最大输出</th><th>能力</th></tr></thead>';
+      table.innerHTML = '<thead><tr><th>模型</th><th>倍率</th><th>上下文</th><th>最大输出</th><th>能力</th><th>推理档位</th></tr></thead>';
       const body = document.createElement('tbody');
       account.models.forEach((model) => {
         const row = document.createElement('tr');
-        [model.name || model.id, model.credits || '—', model.context || '—', model.max_output || '—', [model.images ? '图片' : '', model.reasoning ? '推理' : '', model.tool_call ? '工具' : ''].filter(Boolean).join(' / ') || '—'].forEach((value) => {
+        [model.name || model.id, model.credits || '—', model.context || '—', model.max_output || '—', [model.images ? '图片' : '', model.reasoning ? '推理' : '', model.tool_call ? '工具' : ''].filter(Boolean).join(' / ') || '—', displayReasoningEfforts(model)].forEach((value) => {
           const cell = document.createElement('td');
           cell.textContent = String(value);
           row.append(cell);
