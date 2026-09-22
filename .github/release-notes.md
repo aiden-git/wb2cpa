@@ -1,14 +1,15 @@
 ## wb2cpa ${GITHUB_REF_NAME}
 
-### Fixes
+### Features
 
-- Fixed a JavaScript syntax error in the WorkBuddy management page that prevented every page control from working.
-- Removed the manual Management Token field. The page now reuses the same-origin CPA control-panel authorization when the user has enabled “remember password”.
-- Kept account overview, OAuth login, API Key creation, and refresh routes behind the existing CPA management authorization boundary.
-- Improved management-page feedback for missing authorization, expired authorization, disabled management APIs, and malformed responses.
+- Added per-account platform credit details, including each active package’s used/total credits, remaining credits, availability, and confirmed billing-cycle end.
+- Aggregated all active package balances instead of displaying only the first billing package.
+- Added a dedicated **WorkBuddy 国际版登录** management-menu entry for `www.workbuddy.ai` OAuth.
+- Kept the CPA generic OAuth card on its compatible CN default and retained protected management API authorization.
 
 ### Validation
 
 - `go vet ./...`
 - `go test ./...`
+- Management-page JavaScript simulation for credit rendering and global OAuth entry
 - CGO shared-library build

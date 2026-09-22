@@ -80,8 +80,8 @@ import (
 
 // pluginVersion is injected at link time for release builds:
 //
-//	-ldflags "-X main.pluginVersion=0.5.1"
-var pluginVersion = "0.5.1"
+//	-ldflags "-X main.pluginVersion=0.6.0"
+var pluginVersion = "0.6.0"
 
 const (
 	providerName   = "workbuddy"
@@ -160,22 +160,25 @@ const (
 // accountSummary is deliberately a display-only projection. It never contains
 // API keys, OAuth tokens, raw upstream responses, or the credential storage JSON.
 type accountSummary struct {
-	ID          string         `json:"id"`
-	Label       string         `json:"label"`
-	Nickname    string         `json:"nickname,omitempty"`
-	UID         string         `json:"uid,omitempty"`
-	Realm       string         `json:"realm"`
-	AuthType    string         `json:"auth_type"`
-	Disabled    bool           `json:"disabled"`
-	Plan        string         `json:"plan,omitempty"`
-	Balance     *creditSummary `json:"balance,omitempty"`
-	Enterprise  *creditSummary `json:"enterprise,omitempty"`
-	CycleStart  string         `json:"cycle_start,omitempty"`
-	CycleEnd    string         `json:"cycle_end,omitempty"`
-	Models      []modelSummary `json:"models,omitempty"`
-	UpdatedAt   time.Time      `json:"updated_at"`
-	Error       string         `json:"error,omitempty"`
-	Unsupported bool           `json:"unsupported,omitempty"`
+	ID                    string                 `json:"id"`
+	Label                 string                 `json:"label"`
+	Nickname              string                 `json:"nickname,omitempty"`
+	UID                   string                 `json:"uid,omitempty"`
+	Realm                 string                 `json:"realm"`
+	AuthType              string                 `json:"auth_type"`
+	Disabled              bool                   `json:"disabled"`
+	Plan                  string                 `json:"plan,omitempty"`
+	Balance               *creditSummary         `json:"balance,omitempty"`
+	Enterprise            *creditSummary         `json:"enterprise,omitempty"`
+	CreditPackages        []creditPackageSummary `json:"credit_packages,omitempty"`
+	AvailableCredits      *int                   `json:"available_credits,omitempty"`
+	TotalRemainingCredits *float64               `json:"total_remaining_credits,omitempty"`
+	CycleStart            string                 `json:"cycle_start,omitempty"`
+	CycleEnd              string                 `json:"cycle_end,omitempty"`
+	Models                []modelSummary         `json:"models,omitempty"`
+	UpdatedAt             time.Time              `json:"updated_at"`
+	Error                 string                 `json:"error,omitempty"`
+	Unsupported           bool                   `json:"unsupported,omitempty"`
 }
 
 type creditSummary struct {
@@ -183,6 +186,17 @@ type creditSummary struct {
 	Used      float64 `json:"used"`
 	Total     float64 `json:"total"`
 	Unit      string  `json:"unit"`
+}
+
+type creditPackageSummary struct {
+	Name       string  `json:"name"`
+	Remaining  float64 `json:"remaining"`
+	Used       float64 `json:"used"`
+	Total      float64 `json:"total"`
+	Unit       string  `json:"unit"`
+	CycleStart string  `json:"cycle_start,omitempty"`
+	CycleEnd   string  `json:"cycle_end,omitempty"`
+	Available  bool    `json:"available"`
 }
 
 type modelSummary struct {
@@ -1435,7 +1449,69 @@ func fetchPaymentType(sa *storedAuth) (string, error) {
 	}
 }
 
-func fetchUserResource(sa *storedAuth, now time.Time) (*creditSummary, string, string, error) {
+func billingCapacity(item billingPackage) (remaining, used, total float64) {
+	remaining, used, total = float64(item.CapacityRemain), float64(item.CapacityUsed), float64(item.CapacitySize)
+	if item.CycleCapacitySize > 0 {
+		remaining, used, total = float64(item.CycleCapacityRemain), float64(item.CycleCapacityUsed), float64(item.CycleCapacitySize)
+	}
+	return remaining, used, total
+}
+
+// summarizeCreditPackages projects upstream billing packages into display-safe
+// account data. It deliberately excludes package identifiers and raw metadata.
+func summarizeCreditPackages(items []billingPackage) ([]creditPackageSummary, *creditSummary, string, string) {
+	packages := make([]creditPackageSummary, 0, len(items))
+	var aggregate creditSummary
+	var cycleStart, cycleEnd, unit string
+	hasPackages := false
+	consistentUnit := true
+
+	for _, item := range items {
+		remaining, used, total := billingCapacity(item)
+		if total <= 0 {
+			continue
+		}
+		name := strings.TrimSpace(item.PackageName)
+		if name == "" {
+			name = "平台积分"
+		}
+		packageUnit := "credits"
+		if unit == "" {
+			unit = packageUnit
+			aggregate.Unit = packageUnit
+		} else if unit != packageUnit {
+			consistentUnit = false
+		}
+		isAvailable := remaining > 0
+		packages = append(packages, creditPackageSummary{
+			Name:       name,
+			Remaining:  remaining,
+			Used:       used,
+			Total:      total,
+			Unit:       packageUnit,
+			CycleStart: item.CycleStartTime,
+			CycleEnd:   item.CycleEndTime,
+			Available:  isAvailable,
+		})
+		if !hasPackages {
+			cycleStart, cycleEnd = item.CycleStartTime, item.CycleEndTime
+			hasPackages = true
+		}
+		aggregate.Remaining += remaining
+		aggregate.Used += used
+		aggregate.Total += total
+	}
+
+	if !hasPackages {
+		return nil, nil, "", ""
+	}
+	if !consistentUnit {
+		return packages, nil, cycleStart, cycleEnd
+	}
+	return packages, &aggregate, cycleStart, cycleEnd
+}
+
+func fetchUserResource(sa *storedAuth, now time.Time) (*creditSummary, []creditPackageSummary, string, string, error) {
 	request := map[string]any{
 		"PageNumber":               1,
 		"PageSize":                 100,
@@ -1446,24 +1522,10 @@ func fetchUserResource(sa *storedAuth, now time.Time) (*creditSummary, string, s
 	}
 	var response billingResourceData
 	if err := fetchBillingData(sa, "/v2/billing/meter/get-user-resource", request, &response); err != nil {
-		return nil, "", "", err
+		return nil, nil, "", "", err
 	}
-	var selected *billingPackage
-	for i := range response.Response.Data.Accounts {
-		candidate := &response.Response.Data.Accounts[i]
-		if candidate.CycleCapacitySize > 0 || candidate.CapacitySize > 0 {
-			selected = candidate
-			break
-		}
-	}
-	if selected == nil {
-		return nil, "", "", nil
-	}
-	remaining, used, total := selected.CapacityRemain, selected.CapacityUsed, selected.CapacitySize
-	if selected.CycleCapacitySize > 0 {
-		remaining, used, total = selected.CycleCapacityRemain, selected.CycleCapacityUsed, selected.CycleCapacitySize
-	}
-	return &creditSummary{Remaining: float64(remaining), Used: float64(used), Total: float64(total), Unit: "credits"}, selected.CycleStartTime, selected.CycleEndTime, nil
+	packages, balance, cycleStart, cycleEnd := summarizeCreditPackages(response.Response.Data.Accounts)
+	return balance, packages, cycleStart, cycleEnd, nil
 }
 
 func fetchEnterpriseUsageCN(sa *storedAuth) (*creditSummary, string, string, error) {
@@ -3257,11 +3319,24 @@ func cachedAccountSummary(cacheKey string, sa *storedAuth, item pluginapi.HostAu
 		summary.Unsupported = true
 		summary.Error = "API Key 凭据暂不支持套餐与积分余额查询"
 	} else {
-		balance, cycleStart, cycleEnd, balanceErr := fetchUserResource(sa, time.Now())
+		balance, packages, cycleStart, cycleEnd, balanceErr := fetchUserResource(sa, time.Now())
 		if balanceErr != nil {
 			summary.Error = "套餐或积分余额暂时不可用"
 		} else {
-			summary.Balance, summary.CycleStart, summary.CycleEnd = balance, cycleStart, cycleEnd
+			summary.Balance, summary.CreditPackages, summary.CycleStart, summary.CycleEnd = balance, packages, cycleStart, cycleEnd
+			if balance != nil {
+				remaining := balance.Remaining
+				summary.TotalRemainingCredits = &remaining
+			}
+			if packages != nil {
+				available := 0
+				for _, creditPackage := range packages {
+					if creditPackage.Available {
+						available++
+					}
+				}
+				summary.AvailableCredits = &available
+			}
 		}
 		if plan, planErr := fetchPaymentType(sa); planErr == nil {
 			summary.Plan = plan
@@ -3363,6 +3438,11 @@ func wbManagementRegistration() managementRegResponse {
 				Menu:        "WorkBuddy 管理",
 				Description: "账户概览、套餐与积分余额、国内版/国际版登录、API Key 管理。",
 			},
+			{
+				Path:        "/global-oauth",
+				Menu:        "WorkBuddy 国际版登录",
+				Description: "通过 www.workbuddy.ai 登录国际版 WorkBuddy 账号。",
+			},
 		},
 	}
 }
@@ -3376,7 +3456,7 @@ func handleManagement(raw []byte) ([]byte, error) {
 	path := strings.TrimSpace(req.Path)
 
 	switch {
-	case method == "GET" && strings.HasSuffix(path, "/api-key") && strings.Contains(path, "/resource/plugins/"+providerName):
+	case method == "GET" && strings.Contains(path, "/resource/plugins/"+providerName) && (strings.HasSuffix(path, "/api-key") || strings.HasSuffix(path, "/global-oauth")):
 		return okEnvelope(managementHTMLResponse())
 	case method == "GET" && (path == "/v0/management/workbuddy/accounts" || strings.HasSuffix(path, "/workbuddy/accounts")):
 		accounts, err := listAccountSummaries(false, "")
@@ -3533,7 +3613,7 @@ button:disabled{cursor:not-allowed;opacity:.55}.secondary{background:transparent
 input,textarea,select{box-sizing:border-box;width:100%;padding:9px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text)}
 label{display:block;margin:10px 0 4px;color:var(--muted);font-size:13px}.metric{min-width:120px;border:1px solid var(--border);border-radius:7px;padding:8px}.metric small{color:var(--muted)}.metric strong{display:block;margin-top:4px}
 .badge{font-size:12px;border:1px solid var(--border);border-radius:99px;padding:2px 6px;margin:2px}.models{width:100%;border-collapse:collapse;margin-top:12px;font-size:12px}.models th,.models td{border-top:1px solid var(--border);padding:7px;text-align:left}
-.err{color:#c22}.ok{color:#187a35}.muted,p{color:var(--muted);font-size:13px}textarea{min-height:72px;font-family:ui-monospace,monospace}.panel[hidden]{display:none}.actions{margin-top:8px}
+.err{color:#c22}.ok{color:#187a35}.muted,p{color:var(--muted);font-size:13px}textarea{min-height:72px;font-family:ui-monospace,monospace}.panel[hidden]{display:none}.actions{margin-top:8px}.credit-packages{margin-top:16px}.credit-packages h3{margin-bottom:4px}
 </style>
 </head>
 <body>
@@ -3571,7 +3651,7 @@ label{display:block;margin:10px 0 4px;color:var(--muted);font-size:13px}.metric{
     <h2>OAuth 登录</h2>
     <p>请选择账号所属区域，完成浏览器授权后本页会自动保存凭据。</p>
     <button onclick="startLogin('cn')">登录国内版（CodeBuddy）</button>
-    <button class="secondary" onclick="startLogin('global')">登录国际版（WorkBuddy）</button>
+    <button id="globalLogin" class="secondary" onclick="startLogin('global')">登录国际版（WorkBuddy）</button>
     <p id="loginMsg" role="status" aria-live="polite"></p>
   </div>
 </section>
@@ -3597,6 +3677,7 @@ const base = '/v0/management/workbuddy/';
 const panelAuthStorageKey = 'cli-proxy-auth';
 const panelAuthPrefix = 'enc::v1::';
 const panelAuthSalt = 'cli-proxy-api-webui::secure-storage';
+const globalLoginEntry = location.pathname.endsWith('/global-oauth');
 const summaryEl = document.getElementById('summary');
 const accountsEl = document.getElementById('accounts');
 const keyValueEl = document.getElementById('keyValue');
@@ -3709,7 +3790,44 @@ function displayValue(value) {
 }
 
 function displayCredits(value) {
-  return value ? displayValue(value.remaining) + ' / ' + displayValue(value.total) + ' ' + displayValue(value.unit) : '暂未提供';
+  if (value === undefined || value === null) return '暂未提供';
+  return displayValue(value.used) + ' / ' + displayValue(value.total) + '（剩余 ' + displayValue(value.remaining) + '）' + ' ' + displayValue(value.unit);
+}
+
+function renderCreditPackages(account, card) {
+  const packages = account.credit_packages;
+  if (!packages || !packages.length) return;
+  const section = document.createElement('section');
+  section.className = 'credit-packages';
+  const heading = document.createElement('h3');
+  heading.textContent = '平台积分明细';
+  section.append(heading);
+  const summary = document.createElement('p');
+  summary.className = 'muted';
+  summary.textContent = '可用 ' + displayValue(account.available_credits) + ' 个 · 剩余 ' + displayValue(account.total_remaining_credits) + ' 积分';
+  section.append(summary);
+  const table = document.createElement('table');
+  table.className = 'models';
+  table.innerHTML = '<thead><tr><th>积分包</th><th>已用/总量</th><th>剩余</th><th>周期结束</th><th>状态</th></tr></thead>';
+  const body = document.createElement('tbody');
+  packages.forEach((credit) => {
+    const row = document.createElement('tr');
+    [
+      displayValue(credit.name),
+      displayValue(credit.used) + ' / ' + displayValue(credit.total),
+      displayValue(credit.remaining) + ' ' + displayValue(credit.unit),
+      credit.cycle_end || '暂未提供',
+      credit.available ? '可用' : '已用尽',
+    ].forEach((value) => {
+      const cell = document.createElement('td');
+      cell.textContent = String(value);
+      row.append(cell);
+    });
+    body.append(row);
+  });
+  table.append(body);
+  section.append(table);
+  card.append(section);
 }
 
 function renderAccounts(items) {
@@ -3747,6 +3865,7 @@ function renderAccounts(items) {
     const identity = account.nickname || account.uid || '—';
     [['账号', identity], ['套餐', displayValue(account.plan)], ['积分余额', displayCredits(account.balance)], ['企业额度', displayCredits(account.enterprise)], ['周期', account.cycle_start || account.cycle_end ? displayValue(account.cycle_start) + ' ~ ' + displayValue(account.cycle_end) : '—']].forEach((item) => addMetric(metrics, item[0], item[1]));
     card.append(metrics);
+    renderCreditPackages(account, card);
     if (account.error) {
       const error = document.createElement('p');
       error.textContent = account.error;
@@ -3858,7 +3977,15 @@ async function saveAPIKey() {
 
 restoreTheme();
 managementKey = readPanelManagementKey();
-if (managementKey) {
+if (globalLoginEntry) {
+  switchTab('login', false);
+  document.getElementById('globalLogin').classList.remove('secondary');
+  if (managementKey) {
+    setMessage('loginMsg', '这是国际版入口。请点击“登录国际版（WorkBuddy）”继续。');
+  } else {
+    setMessage('loginMsg', '未检测到 CPA 管理授权。请在管理中心登录时启用“记住密码”，然后刷新本页。', true);
+  }
+} else if (managementKey) {
   loadAccounts(false);
 } else {
   accountsEl.textContent = '未检测到 CPA 管理授权。请在管理中心登录时启用“记住密码”，然后刷新本页。';
